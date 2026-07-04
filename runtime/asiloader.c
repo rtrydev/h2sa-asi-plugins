@@ -38,6 +38,7 @@
  * COM ABI, verified against the mingw d3d8.h vtable structs). */
 #define IDX_D3D8_CREATEDEVICE   15
 #define IDX_DEV_RESET           14
+#define IDX_DEV_PRESENT         15
 #define IDX_DEV_SETTRANSFORM    37
 #define IDX_DEV_SETVIEWPORT     40
 
@@ -49,6 +50,7 @@ static HMODULE g_real;              /* system d3d8.dll, resolved lazily */
 static H2SAD3D8Hooks g_hooks;       /* registered by a plugin (zeroed = none) */
 static void *g_orig_createdevice;
 static void *g_orig_reset;
+static void *g_orig_present;
 static void *g_orig_settransform;
 static void *g_orig_setviewport;
 static unsigned int g_bbw, g_bbh;   /* backbuffer size of the live device */
@@ -166,6 +168,19 @@ static HRESULT WINAPI hook_SetTransform(IDirect3DDevice8 *self,
     return ((st_t)g_orig_settransform)(self, State, pMatrix);
 }
 
+static HRESULT WINAPI hook_Present(IDirect3DDevice8 *self,
+    CONST RECT *src, CONST RECT *dst, HWND override, CONST RGNDATA *dirty)
+{
+    typedef HRESULT (WINAPI *pr_t)(IDirect3DDevice8 *, CONST RECT *,
+        CONST RECT *, HWND, CONST RGNDATA *);
+    HRESULT hr = ((pr_t)g_orig_present)(self, src, dst, override, dirty);
+    /* One displayed frame just finished; let the plugin pace the frame rate
+     * (the engine's simulation is frame-time bound). */
+    if (g_hooks.on_present)
+        g_hooks.on_present();
+    return hr;
+}
+
 static HRESULT WINAPI hook_Reset(IDirect3DDevice8 *self,
     D3DPRESENT_PARAMETERS *pp)
 {
@@ -202,13 +217,15 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
         if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_RESET,
                    (void *)hook_Reset, &g_orig_reset);
+        patch_slot(*ppReturnedDeviceInterface, IDX_DEV_PRESENT,
+                   (void *)hook_Present, &g_orig_present);
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETTRANSFORM,
                    (void *)hook_SetTransform, &g_orig_settransform);
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETVIEWPORT,
                    (void *)hook_SetViewport, &g_orig_setviewport);
         if (g_hooks.on_device)
             g_hooks.on_device(*ppReturnedDeviceInterface);
-        logf_("device %p wrapped (Reset+SetTransform)",
+        logf_("device %p wrapped (Reset+Present+SetTransform+SetViewport)",
               *ppReturnedDeviceInterface);
     }
     return hr;

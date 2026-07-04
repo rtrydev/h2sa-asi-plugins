@@ -47,6 +47,8 @@
  *   FOVFactor=1.0   ; extra horizontal FOV multiplier (>1 = wider)
  *   CursorFix=-1    ; hide the host (Mac) cursor over the game: -1 auto
  *                   ; (on under Wine), 0 off, 1 on
+ *   FpsCap=60       ; frame-rate cap (the engine is frame-time bound and
+ *                   ; misbehaves uncapped); 0 = uncapped
  */
 #include <d3d8.h>
 #include <stdio.h>
@@ -62,6 +64,7 @@ static int g_borderless = -1;      /* -1 auto (Wine), 0 never, 1 always */
 static int g_fullscreen = 0;       /* 1 = exclusive fullscreen (see below) */
 static int g_fovcorrect = 1;
 static float g_fovfactor = 1.0f;
+static int g_fpscap = 60;           /* frame-rate cap; 0 = uncapped */
 static int g_borderless_active;    /* a fullscreen request was converted */
 static int g_ini_w, g_ini_h;       /* Resolution WxH parsed from Hitman2.ini */
 static int g_cursorfix = -1;       /* -1 auto (Wine), 0 off, 1 on */
@@ -109,9 +112,13 @@ static void read_config(void)
         else if (sscanf(line, " FOVFactor = %f", &v) == 1 ||
                  sscanf(line, " FOVFactor=%f", &v) == 1)
             g_fovfactor = v;
+        else if (sscanf(line, " FpsCap = %d", &b) == 1 ||
+                 sscanf(line, " FpsCap=%d", &b) == 1)
+            g_fpscap = b;
     }
     fclose(f);
     if (!(g_fovfactor >= 0.5f && g_fovfactor <= 2.0f)) g_fovfactor = 1.0f;
+    if (g_fpscap < 0 || g_fpscap > 1000) g_fpscap = 60;
 }
 
 /* Parse "Resolution WxH" from Hitman2.ini in the game root (the parent of
@@ -617,9 +624,15 @@ static DWORD WINAPI cursor_watch(LPVOID arg)
     return 0;
 }
 
+/* Borderless-fullscreen is the default on every platform (-1 auto = on).
+ * On Windows the alternative — a forced *plain* window at the backbuffer
+ * size — is both ugly and unstable (the stock engine does not expect to be
+ * windowed and could misbehave/crash), so auto means "borderless" there too;
+ * exclusive fullscreen (Fullscreen=1, valid mode) is handled separately. Set
+ * Borderless=0 to force a plain window on purpose. */
 static int borderless_wanted(void)
 {
-    return g_borderless == 1 || (g_borderless == -1 && is_wine());
+    return g_borderless != 0;   /* -1 auto and 1 -> borderless; 0 -> plain */
 }
 
 /* Strip the game window to a borderless popup with a client area of w x h
@@ -802,11 +815,71 @@ static void fix_projection(D3DMATRIX *m, unsigned int bbw, unsigned int bbh)
     }
 }
 
+/* Frame limiter. Hitman 2's engine advances its simulation from the measured
+ * frame time, and at the hundreds of FPS a modern GPU reaches (especially
+ * windowed, where there is no fullscreen vsync) the physics, animation and
+ * input timing go haywire — objects fling, the camera oversteers, scripted
+ * timing breaks. Capping the frame rate restores stock-like pacing. Called
+ * once per presented frame by the loader. A hybrid sleep+spin holds the
+ * target period accurately without burning a whole core. */
+static void frame_limit(void)
+{
+    if (g_fpscap <= 0) return;
+
+    static LARGE_INTEGER freq, next;
+    static int init;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (!init) {
+        QueryPerformanceFrequency(&freq);
+        next = now;
+        init = 1;
+    }
+    if (freq.QuadPart <= 0) return;
+
+    LONGLONG period = freq.QuadPart / g_fpscap;
+    next.QuadPart += period;
+    /* If we fell more than one frame behind (alt-tab, a hitch), resync so we
+     * do not "catch up" by running unbounded fast frames. */
+    if (next.QuadPart < now.QuadPart)
+        next.QuadPart = now.QuadPart + period;
+
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        LONGLONG remain = next.QuadPart - now.QuadPart;
+        if (remain <= 0) break;
+        DWORD ms = (DWORD)((remain * 1000) / freq.QuadPart);
+        if (ms > 1)
+            Sleep(ms - 1);        /* coarse wait, leave the last ~1ms to spin */
+        else
+            Sleep(0);             /* yield the rest of the timeslice */
+    }
+
+    /* Log the measured rate for the first few seconds so a run confirms the
+     * cap engaged, then go quiet (no unbounded log growth). */
+    static int samples;
+    static LARGE_INTEGER win_start;
+    static long frames;
+    if (samples < 5) {
+        frames++;
+        if (win_start.QuadPart == 0)
+            win_start = now;
+        LONGLONG elapsed = now.QuadPart - win_start.QuadPart;
+        if (elapsed >= freq.QuadPart) {   /* ~1s window */
+            logf_("frame limiter: ~%ld fps (cap %d)", frames, g_fpscap);
+            samples++;
+            frames = 0;
+            win_start = now;
+        }
+    }
+}
+
 static const H2SAD3D8Hooks g_hooks = {
     H2SA_D3D8_HOOKS_VERSION,
     fix_present,
     fix_projection,
     NULL,
+    frame_limit,
 };
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
@@ -833,9 +906,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         if (g_enabled)
             CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
         logf_("H2SA Widescreen loaded%s, Fullscreen=%d Borderless=%d "
-              "FOVCorrect=%d FOVFactor=%.2f, Hitman2.ini resolution %dx%d",
-              g_enabled ? "" : " (disabled)", g_fullscreen, g_borderless,
-              g_fovcorrect, (double)g_fovfactor, g_ini_w, g_ini_h);
+              "FOVCorrect=%d FOVFactor=%.2f FpsCap=%d, Hitman2.ini "
+              "resolution %dx%d", g_enabled ? "" : " (disabled)",
+              g_fullscreen, g_borderless, g_fovcorrect, (double)g_fovfactor,
+              g_fpscap, g_ini_w, g_ini_h);
 
         HMODULE loader = GetModuleHandleA("d3d8.dll");
         h2sa_register_fn reg = loader ? (h2sa_register_fn)(uintptr_t)

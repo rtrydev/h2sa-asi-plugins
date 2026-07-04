@@ -176,13 +176,24 @@ Config: `scripts/H2SAWidescreen.ini`
 Enabled=1
 Fullscreen=0    ; 1 = exclusive fullscreen when Resolution is a real display
                 ; mode, else borderless; 0 = always windowed/borderless
-Borderless=-1   ; when not fullscreen: -1 auto (borderless, fills desktop,
-                ; under Wine), 0 plain window, 1 always borderless
+Borderless=-1   ; when not fullscreen: -1 auto = borderless fills desktop
+                ; (all platforms), 0 plain window, 1 always borderless
 FOVCorrect=1    ; Hor+ projection correction on/off
 FOVFactor=1.0   ; extra horizontal FOV multiplier (>1 = wider)
 CursorFix=-1    ; hide the stray macOS cursor + auto-activate at startup:
                 ; -1 auto (on under Wine), 0 off, 1 on
+FpsCap=60       ; frame-rate cap; 0 = uncapped (see below)
 ```
+
+### Frame-rate cap
+
+Hitman 2's engine advances its simulation from the measured frame time, so on
+modern hardware — where the game can run at hundreds of FPS, especially
+windowed with no fullscreen vsync — the physics, camera and scripted timing
+misbehave (objects fling around, the camera oversteers, things run too fast).
+The loader wraps `IDirect3DDevice8::Present` and the plugin paces each frame to
+hold `FpsCap` (default **60**), which restores stock-like behaviour. Set
+`FpsCap=0` to disable the cap. This applies on every platform.
 
 Install output:
 

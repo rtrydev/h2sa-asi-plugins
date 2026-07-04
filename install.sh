@@ -35,7 +35,7 @@ cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 # Widescreen + startup fix plugin
 cp "$HERE/dist/H2SAWidescreen.asi" "$GAME/scripts/"
 if [ ! -f "$GAME/scripts/H2SAWidescreen.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=-1\n' \
+    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=-1\nFpsCap=60\n' \
         > "$GAME/scripts/H2SAWidescreen.ini"
 fi
 

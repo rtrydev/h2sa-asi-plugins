@@ -22,7 +22,7 @@
 
 #include <d3d8.h>
 
-#define H2SA_D3D8_HOOKS_VERSION 1
+#define H2SA_D3D8_HOOKS_VERSION 2
 
 typedef struct H2SAD3D8Hooks {
     unsigned int version;   /* set to H2SA_D3D8_HOOKS_VERSION */
@@ -44,6 +44,13 @@ typedef struct H2SAD3D8Hooks {
     /* Optional: called once with the real device right after a successful
      * CreateDevice (may be NULL). */
     void (*on_device)(IDirect3DDevice8 *dev);
+
+    /* Optional (may be NULL): called right after each successful
+     * IDirect3DDevice8::Present returns, i.e. once per displayed frame. Used
+     * to pace the frame rate — Hitman 2's engine ties simulation to frame
+     * time, so an uncapped modern GPU makes it run wild; the plugin sleeps
+     * here to hold a target FPS. */
+    void (*on_present)(void);
 } H2SAD3D8Hooks;
 
 typedef void (WINAPI *h2sa_register_fn)(const H2SAD3D8Hooks *hooks);
