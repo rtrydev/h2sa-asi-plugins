@@ -1,0 +1,6 @@
+.DS_Store
+dist/*.dll
+dist/*.asi
+tests/*.exe
+*.o
+*.tmp

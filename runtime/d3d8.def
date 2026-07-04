@@ -1,0 +1,11 @@
+; Real d3d8.dll export layout. RenderD3D.dll imports Direct3DCreate8 by
+; name; the ordinals are kept identical to the system d3d8.dll so the proxy
+; is a correct drop-in. H2SA_RegisterD3D8Hooks is this loader's own export.
+LIBRARY d3d8.dll
+EXPORTS
+    D3D8GetSWInfo @1
+    DebugSetMute @2
+    Direct3DCreate8 @3
+    ValidatePixelShader @4
+    ValidateVertexShader @5
+    H2SA_RegisterD3D8Hooks
