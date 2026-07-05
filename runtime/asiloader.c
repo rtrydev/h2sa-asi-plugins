@@ -47,7 +47,9 @@ static char g_dir[MAX_PATH];        /* game directory (location of this dll) */
 static HINSTANCE g_self;
 static HMODULE g_real;              /* system d3d8.dll, resolved lazily */
 
-static H2SAD3D8Hooks g_hooks;       /* registered by a plugin (zeroed = none) */
+#define MAX_HOOKSETS 8
+static H2SAD3D8Hooks g_hooks[MAX_HOOKSETS];  /* one per registered plugin */
+static int g_n_hooks;               /* number of registered hook sets */
 static void *g_orig_createdevice;
 static void *g_orig_reset;
 static void *g_orig_present;
@@ -160,10 +162,16 @@ static HRESULT WINAPI hook_SetTransform(IDirect3DDevice8 *self,
               pMatrix->_33, pMatrix->_34, pMatrix->_43, pMatrix->_44,
               g_bbw, g_bbh);
     }
-    if (State == D3DTS_PROJECTION && pMatrix && g_hooks.fix_projection) {
+    if (State == D3DTS_PROJECTION && pMatrix) {
         D3DMATRIX m = *pMatrix;
-        g_hooks.fix_projection(&m, g_bbw, g_bbh);
-        return ((st_t)g_orig_settransform)(self, State, &m);
+        int any = 0;
+        for (int i = 0; i < g_n_hooks; i++)
+            if (g_hooks[i].fix_projection) {
+                g_hooks[i].fix_projection(&m, g_bbw, g_bbh);
+                any = 1;
+            }
+        if (any)
+            return ((st_t)g_orig_settransform)(self, State, &m);
     }
     return ((st_t)g_orig_settransform)(self, State, pMatrix);
 }
@@ -173,11 +181,17 @@ static HRESULT WINAPI hook_Present(IDirect3DDevice8 *self,
 {
     typedef HRESULT (WINAPI *pr_t)(IDirect3DDevice8 *, CONST RECT *,
         CONST RECT *, HWND, CONST RGNDATA *);
+    /* Before the frame is shown: let overlays draw onto the finished back
+     * buffer (drawing in on_present, below, would land after Present). */
+    for (int i = 0; i < g_n_hooks; i++)
+        if (g_hooks[i].on_frame)
+            g_hooks[i].on_frame(self);
     HRESULT hr = ((pr_t)g_orig_present)(self, src, dst, override, dirty);
-    /* One displayed frame just finished; let the plugin pace the frame rate
+    /* One displayed frame just finished; let plugins pace the frame rate
      * (the engine's simulation is frame-time bound). */
-    if (g_hooks.on_present)
-        g_hooks.on_present();
+    for (int i = 0; i < g_n_hooks; i++)
+        if (g_hooks[i].on_present)
+            g_hooks[i].on_present();
     return hr;
 }
 
@@ -185,8 +199,10 @@ static HRESULT WINAPI hook_Reset(IDirect3DDevice8 *self,
     D3DPRESENT_PARAMETERS *pp)
 {
     typedef HRESULT (WINAPI *rs_t)(IDirect3DDevice8 *, D3DPRESENT_PARAMETERS *);
-    if (pp && g_hooks.fix_present)
-        g_hooks.fix_present(pp, NULL, 1);
+    if (pp)
+        for (int i = 0; i < g_n_hooks; i++)
+            if (g_hooks[i].fix_present)
+                g_hooks[i].fix_present(pp, NULL, 1);
     if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }
     return ((rs_t)g_orig_reset)(self, pp);
 }
@@ -201,8 +217,10 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
         logf_("CreateDevice requested: %ux%u fmt=%d windowed=%d swap=%d",
               pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat,
               pp->Windowed, pp->SwapEffect);
-    if (pp && g_hooks.fix_present)
-        g_hooks.fix_present(pp, hFocusWindow, 0);
+    if (pp)
+        for (int i = 0; i < g_n_hooks; i++)
+            if (g_hooks[i].fix_present)
+                g_hooks[i].fix_present(pp, hFocusWindow, 0);
     if (pp)
         logf_("CreateDevice applied:   %ux%u fmt=%d windowed=%d",
               pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat,
@@ -242,8 +260,9 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
                    (void *)hook_SetTransform, &g_orig_settransform);
         patch_slot(*ppReturnedDeviceInterface, IDX_DEV_SETVIEWPORT,
                    (void *)hook_SetViewport, &g_orig_setviewport);
-        if (g_hooks.on_device)
-            g_hooks.on_device(*ppReturnedDeviceInterface);
+        for (int i = 0; i < g_n_hooks; i++)
+            if (g_hooks[i].on_device)
+                g_hooks[i].on_device(*ppReturnedDeviceInterface);
         logf_("device %p wrapped (Reset+Present+SetTransform+SetViewport)",
               *ppReturnedDeviceInterface);
     }
@@ -308,10 +327,16 @@ __declspec(dllexport) void WINAPI H2SA_RegisterD3D8Hooks(
               hooks ? hooks->version : 0, H2SA_D3D8_HOOKS_VERSION);
         return;
     }
-    g_hooks = *hooks;
-    logf_("plugin registered D3D8 hooks (fix_present=%p fix_projection=%p "
-          "on_device=%p)", (void *)g_hooks.fix_present,
-          (void *)g_hooks.fix_projection, (void *)g_hooks.on_device);
+    if (g_n_hooks >= MAX_HOOKSETS) {
+        logf_("H2SA_RegisterD3D8Hooks: too many plugins (max %d)", MAX_HOOKSETS);
+        return;
+    }
+    H2SAD3D8Hooks *h = &g_hooks[g_n_hooks++];
+    *h = *hooks;
+    logf_("plugin #%d registered D3D8 hooks (fix_present=%p fix_projection=%p "
+          "on_device=%p on_frame=%p on_present=%p)", g_n_hooks,
+          (void *)h->fix_present, (void *)h->fix_projection,
+          (void *)h->on_device, (void *)h->on_frame, (void *)h->on_present);
 }
 
 /* ---- ASI loading ----------------------------------------------------- */

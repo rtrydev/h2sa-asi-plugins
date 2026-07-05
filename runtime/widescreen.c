@@ -28,25 +28,26 @@
  * All of this happens at the fixed Direct3D 8 COM ABI via the loader's
  * H2SA_RegisterD3D8Hooks, so there are no game-build byte offsets to break.
  *
- * Exclusive fullscreen is available too (Fullscreen=1), but only works at a
- * resolution the display actually enumerates. Under CrossOver that list is
- * the Mac's Retina-scaled (16:10) modes — 1280x800, 1920x1200, 2560x1600,
- * ... — and none of the classic game resolutions (800x600, 1280x1024,
- * 1920x1080) are in it, which is exactly why the stock game's fullscreen
- * device fails. Set Resolution to one of the enumerated modes for true
- * fullscreen; at any other resolution Fullscreen falls back to borderless.
+ * Exclusive fullscreen (Fullscreen=1) is REAL WINDOWS ONLY, and only at a
+ * resolution the display actually enumerates. Under CrossOver on a Retina Mac
+ * it is broken — winemac drives the captured display at a 2x backing scale so
+ * the fullscreen surface renders larger than the panel and the picture spills
+ * off-screen with the HUD clipped — so on Wine Fullscreen=1 is treated as
+ * borderless-fullscreen, which fills the screen correctly. Borderless is the
+ * right "fullscreen" on this stack; there is nothing to gain from the
+ * exclusive path here (the present cost is the same under D3DMetal).
  *
  * Config: scripts/H2SAWidescreen.ini
  *   [Widescreen]
  *   Enabled=1
- *   Fullscreen=0    ; 1 = exclusive fullscreen when Resolution is a real
- *                   ; display mode, else borderless (0 = always windowed)
+ *   Fullscreen=0    ; 1 = exclusive fullscreen (real Windows only, at an
+ *                   ; enumerated mode); on Wine/Mac -> borderless-fullscreen
  *   Borderless=-1   ; when not fullscreen: -1 auto (borderless, filling the
  *                   ; desktop, under Wine), 0 plain window, 1 always borderless
  *   FOVCorrect=1    ; Hor+ projection correction on/off
  *   FOVFactor=1.0   ; extra horizontal FOV multiplier (>1 = wider)
- *   CursorFix=-1    ; hide the host (Mac) cursor over the game: -1 auto
- *                   ; (on under Wine), 0 off, 1 on
+ *   CursorFix=0     ; hide the host (Mac) cursor over the game: 0 off
+ *                   ; (default — see note), 1 on, -1 auto (on under Wine)
  *   FpsCap=60       ; frame-rate cap (the engine is frame-time bound and
  *                   ; misbehaves uncapped); 0 = uncapped
  *   VSync=-1        ; -1 auto: in exclusive fullscreen, let the display pace
@@ -83,7 +84,12 @@ static int g_caps_done;             /* caps queried yet? */
 static volatile int g_hw_paced;     /* display (vsync divisor) paces the rate */
 static int g_borderless_active;    /* a fullscreen request was converted */
 static int g_ini_w, g_ini_h;       /* Resolution WxH parsed from Hitman2.ini */
-static int g_cursorfix = -1;       /* -1 auto (Wine), 0 off, 1 on */
+static int g_cursorfix = 0;        /* 0 off (default), 1 on, -1 auto (Wine).
+                                    * Off by default: in borderless/fullscreen
+                                    * on this Mac stack the host cursor no
+                                    * longer leaks, and the per-frame hide/
+                                    * re-prime + SetCursorPos churn made camera
+                                    * movement feel heavy — net negative. */
 static HWND g_game_hwnd;           /* the game window, learned at device init */
 static volatile DWORD g_fg_deadline; /* startup-activation window still open */
 static volatile DWORD g_next_kick;   /* earliest tick for the next kick */
@@ -857,14 +863,25 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
         pp->BackBufferHeight = (UINT)g_ini_h;
     }
 
-    /* Exclusive fullscreen: only viable if the requested resolution is an
-     * actual enumerated display mode (otherwise CreateDevice returns
-     * D3DERR_NOTAVAILABLE). We do NOT clamp to a different mode, because the
-     * engine would keep laying out for the ini resolution and mismatch the
-     * device. So: honour fullscreen when the resolution is a real mode,
-     * otherwise fall through to the always-works windowed path and say why. */
-    if (g_fullscreen && is_display_mode((int)pp->BackBufferWidth,
-                                        (int)pp->BackBufferHeight)) {
+    /* Exclusive fullscreen — REAL WINDOWS ONLY. It needs the requested
+     * resolution to be an actual enumerated display mode (else CreateDevice
+     * returns D3DERR_NOTAVAILABLE); we don't clamp to a different mode because
+     * the engine would keep laying out for the ini resolution and mismatch the
+     * device.
+     *
+     * Under Wine/CrossOver on a Retina Mac, exclusive fullscreen is broken:
+     * winemac (with the default RetinaMode=y) drives the captured display at a
+     * 2x backing scale, so a mode like 1920x1200 becomes a 3840x2400-pixel
+     * surface — larger than the physical panel — and the picture spills past
+     * the screen edges with the HUD clipped off. There is no per-app fix from
+     * inside the game, and the mode change also breaks alt-tab and the cursor.
+     * So on Wine we never take the exclusive path: Fullscreen=1 falls through
+     * to borderless-fullscreen, which fills the screen correctly (macOS
+     * composites/scales the window properly) and is what "fullscreen" should
+     * mean on this stack. */
+    if (g_fullscreen && !is_wine() &&
+        is_display_mode((int)pp->BackBufferWidth,
+                        (int)pp->BackBufferHeight)) {
         pp->Windowed = FALSE;
         pp->BackBufferFormat = D3DFMT_X8R8G8B8;
         pp->FullScreen_RefreshRateInHz = 0;   /* default refresh */
@@ -880,7 +897,12 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
               pp->BackBufferWidth, pp->BackBufferHeight);
         return;
     }
-    if (g_fullscreen)
+    if (g_fullscreen && is_wine())
+        logf_("Fullscreen=1 on Wine/CrossOver: exclusive fullscreen oversizes "
+              "on Retina (2x backing scale -> surface bigger than the panel, "
+              "content clipped) — using borderless fullscreen, which fills the "
+              "screen correctly. Real exclusive fullscreen is Windows-only.");
+    else if (g_fullscreen)
         logf_("Fullscreen=1 but %ux%u is not an enumerated display mode — "
               "using borderless windowed instead (set Resolution to a mode "
               "your display exposes for true fullscreen)",
@@ -903,7 +925,11 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
     if (pp->SwapEffect == D3DSWAPEFFECT_FLIP)
         pp->SwapEffect = D3DSWAPEFFECT_DISCARD;  /* FLIP is fullscreen-only */
 
-    if ((was_fullscreen || g_fullscreen) && borderless_wanted())
+    /* A Fullscreen=1 request on Wine becomes borderless-fullscreen (fills the
+     * desktop) even if Borderless was turned off — that is what the user asked
+     * for. Otherwise honour the borderless setting. */
+    if ((was_fullscreen || g_fullscreen) &&
+        (borderless_wanted() || (g_fullscreen && is_wine())))
         g_borderless_active = 1;
 
     /* Borderless-fullscreen: a frameless window covering the whole desktop,

@@ -11,7 +11,9 @@ LDFLAGS := -shared -Wl,--kill-at -static -lkernel32
 
 .PHONY: all clean
 
-all: ../dist/d3d8.dll ../dist/H2SAWidescreen.asi
+all: ../dist/d3d8.dll ../dist/H2SAWidescreen.asi \
+     ../dist/H2SAReducedX87.asi ../dist/H2SAReducedX87-diag.asi \
+     ../dist/H2SAProfiler.asi
 
 ../dist/d3d8.dll: asiloader.c d3d8.def h2sa_d3d8.h
 	@mkdir -p ../dist
@@ -22,5 +24,26 @@ all: ../dist/d3d8.dll ../dist/H2SAWidescreen.asi
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ widescreen.c $(LDFLAGS) -luser32 -lgdi32 -lwinmm
 
+../dist/H2SAReducedX87.asi: h2sax87.c helpers.S
+	@mkdir -p ../dist
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+../dist/H2SAReducedX87-diag.asi: h2sax87.c helpers.S
+	@mkdir -p ../dist
+	$(CC) $(CFLAGS) -DH2SA_DIAG -o $@ $^ $(LDFLAGS)
+
+../dist/H2SAProfiler.asi: profiler.c h2sa_d3d8.h
+	@mkdir -p ../dist
+	$(CC) $(CFLAGS) -o $@ profiler.c $(LDFLAGS) -ld3d8
+
+# memory dumper for the packed hitman2.exe (not part of `all`)
+dump: ../dist/H2SADump.asi
+
+../dist/H2SADump.asi: dumper.c
+	@mkdir -p ../dist
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
 clean:
-	rm -f ../dist/d3d8.dll ../dist/H2SAWidescreen.asi
+	rm -f ../dist/d3d8.dll ../dist/H2SAWidescreen.asi \
+	      ../dist/H2SAReducedX87.asi ../dist/H2SAReducedX87-diag.asi \
+	      ../dist/H2SAProfiler.asi ../dist/H2SADump.asi

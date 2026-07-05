@@ -22,7 +22,7 @@
 
 #include <d3d8.h>
 
-#define H2SA_D3D8_HOOKS_VERSION 2
+#define H2SA_D3D8_HOOKS_VERSION 3
 
 typedef struct H2SAD3D8Hooks {
     unsigned int version;   /* set to H2SA_D3D8_HOOKS_VERSION */
@@ -51,7 +51,19 @@ typedef struct H2SAD3D8Hooks {
      * time, so an uncapped modern GPU makes it run wild; the plugin sleeps
      * here to hold a target FPS. */
     void (*on_present)(void);
+
+    /* Optional (may be NULL): called with the live device just BEFORE each
+     * IDirect3DDevice8::Present forwards to the real implementation — i.e.
+     * once per frame while the finished back buffer is still intact. This is
+     * where overlays draw (an on_present draw would land after the frame is
+     * already shown). The scene has ended by this point; a plugin that draws
+     * must save/restore device state around its own draw calls. */
+    void (*on_frame)(IDirect3DDevice8 *dev);
 } H2SAD3D8Hooks;
+
+/* Multiple plugins may register; the loader keeps every hook set and invokes
+ * each non-NULL callback in registration order. fix_present / fix_projection
+ * are applied in turn (each sees the previous plugin's edits). */
 
 typedef void (WINAPI *h2sa_register_fn)(const H2SAD3D8Hooks *hooks);
 
