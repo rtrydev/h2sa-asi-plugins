@@ -489,9 +489,11 @@ static void draw(IDirect3DDevice8 *dev)
     D3DVIEWPORT8 vp;
     if (FAILED(VT(dev, 41, GetVP_t)(dev, &vp))) return;
 
-    /* Same glyph metric as the h2-stats-overlay SA/AZ text (cell = 2 at
-     * Scale 1.0), and, like it, no background panel — just outlined text. */
-    const float cell = g_scale < 0.5f ? 1.0f : 2.0f * g_scale;
+    /* Identical glyph metric to h2-stats-overlay: cell = max(1, 2*Scale),
+     * so a given Scale renders the same size in both plugins. Default Scale
+     * 1.0 => cell 2 (integer, so pixel-crisp; non-integer cells blur).
+     * Like it, no background panel — just outlined text. */
+    const float cell = 2.0f * g_scale < 1.0f ? 1.0f : 2.0f * g_scale;
     const float lh   = 9.0f * cell;                 /* line height */
     const float right = (float)(vp.X + vp.Width - g_off_x);
     float y = (float)(vp.Y + g_off_y);
