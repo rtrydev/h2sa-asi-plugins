@@ -49,13 +49,24 @@
  *                   ; (on under Wine), 0 off, 1 on
  *   FpsCap=60       ; frame-rate cap (the engine is frame-time bound and
  *                   ; misbehaves uncapped); 0 = uncapped
+ *   VSync=-1        ; -1 auto: in exclusive fullscreen, let the display pace
+ *                   ; the cap (present every Nth vblank when refresh = N*cap),
+ *                   ; else vsync every frame; 0 off (software cap only, may
+ *                   ; tear); 1 force vsync-every-frame
  */
 #include <d3d8.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
+#include <mmsystem.h>
+#include <immintrin.h>          /* _mm_pause for the limiter spin */
 #include "h2sa_d3d8.h"
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  /* Win10 1803+ */
+#endif
 
 static FILE *g_log;
 static char g_dir[MAX_PATH];
@@ -65,6 +76,11 @@ static int g_fullscreen = 0;       /* 1 = exclusive fullscreen (see below) */
 static int g_fovcorrect = 1;
 static float g_fovfactor = 1.0f;
 static int g_fpscap = 60;           /* frame-rate cap; 0 = uncapped */
+static int g_vsync = -1;            /* -1 auto, 0 off, 1 force vsync-every-frame */
+static DWORD g_present_intervals;   /* D3DCAPS8.PresentationIntervals, cached */
+static D3DFORMAT g_desktop_fmt = D3DFMT_X8R8G8B8; /* desktop backbuffer format */
+static int g_caps_done;             /* caps queried yet? */
+static volatile int g_hw_paced;     /* display (vsync divisor) paces the rate */
 static int g_borderless_active;    /* a fullscreen request was converted */
 static int g_ini_w, g_ini_h;       /* Resolution WxH parsed from Hitman2.ini */
 static int g_cursorfix = -1;       /* -1 auto (Wine), 0 off, 1 on */
@@ -115,6 +131,9 @@ static void read_config(void)
         else if (sscanf(line, " FpsCap = %d", &b) == 1 ||
                  sscanf(line, " FpsCap=%d", &b) == 1)
             g_fpscap = b;
+        else if (sscanf(line, " VSync = %d", &b) == 1 ||
+                 sscanf(line, " VSync=%d", &b) == 1)
+            g_vsync = b < 0 ? -1 : (b != 0);
     }
     fclose(f);
     if (!(g_fovfactor >= 0.5f && g_fovfactor <= 2.0f)) g_fovfactor = 1.0f;
@@ -679,6 +698,136 @@ static int is_display_mode(int w, int h)
     return 0;
 }
 
+/* Cache the HAL's supported presentation intervals once. We create our own
+ * throwaway IDirect3D8 (via the loaded d3d8.dll proxy export) and query
+ * D3DCAPS8 — GetDeviceCaps needs no device, so there is no mode switch. This
+ * runs lazily from the first CreateDevice fixup (game thread, outside the
+ * loader lock, after the game's own Direct3DCreate8 has already mapped the
+ * system d3d8), so it is safe. */
+static void read_caps_once(void)
+{
+    if (g_caps_done) return;
+    g_caps_done = 1;
+    HMODULE ld = GetModuleHandleA("d3d8.dll");
+    if (!ld) return;
+    IDirect3D8 *(WINAPI *create)(UINT) =
+        (IDirect3D8 *(WINAPI *)(UINT))(uintptr_t)
+        GetProcAddress(ld, "Direct3DCreate8");
+    if (!create) return;
+    IDirect3D8 *d = create(D3D_SDK_VERSION);
+    if (!d) return;
+    D3DCAPS8 caps;
+    if (SUCCEEDED(d->lpVtbl->GetDeviceCaps(d, D3DADAPTER_DEFAULT,
+                                           D3DDEVTYPE_HAL, &caps)))
+        g_present_intervals = caps.PresentationIntervals;
+    /* Remember the actual desktop backbuffer format. A windowed device needs
+     * a concrete format: native D3D8 rejects D3DFMT_UNKNOWN for a windowed
+     * backbuffer with D3DERR_INVALIDCALL (wined3d tolerates it, which is why
+     * the borderless path worked under CrossOver but not on real Windows). */
+    D3DDISPLAYMODE mode;
+    if (SUCCEEDED(d->lpVtbl->GetAdapterDisplayMode(d, D3DADAPTER_DEFAULT,
+                                                   &mode)))
+        g_desktop_fmt = mode.Format;
+    d->lpVtbl->Release(d);
+    logf_("device present-interval caps = 0x%08lx, desktop fmt = %d",
+          (unsigned long)g_present_intervals, g_desktop_fmt);
+}
+
+/* Is w x h @ refresh Hz an enumerated 32-bit display mode? */
+static int is_refresh_mode(int w, int h, int hz)
+{
+    DEVMODEA dm;
+    memset(&dm, 0, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    for (DWORD i = 0; EnumDisplaySettingsA(NULL, i, &dm); i++) {
+        if (dm.dmBitsPerPel >= 32 &&
+            (int)dm.dmPelsWidth == w && (int)dm.dmPelsHeight == h &&
+            (int)dm.dmDisplayFrequency == hz)
+            return 1;
+    }
+    return 0;
+}
+
+/* Choose an exclusive-fullscreen presentation interval that lets the DISPLAY
+ * pace the frame rate, so the cap is jitter-free and the software limiter can
+ * stand down (two independent clocks — the vsync grid and a QPC accumulator —
+ * beat against each other and cause the "60fps but choppy" judder).
+ *
+ * When the refresh is ~an integer multiple N of the target (e.g. 240Hz / 60 =
+ * 4) and INTERVAL_N is supported, present every Nth vblank: the hardware then
+ * scans out exactly `cap` unique frames per second, perfectly spaced. If the
+ * refresh is not a clean multiple, try pinning an enumerated cap-Hz (or
+ * 2*cap-Hz) mode; failing that, vsync every frame (tear-free) and let the
+ * software limiter do the cap. NOTE: non-DEFAULT intervals are fullscreen-only
+ * in D3D8 — the windowed/borderless path must use DEFAULT + software limiter. */
+static const DWORD k_intervals[5] = {
+    0, D3DPRESENT_INTERVAL_ONE, D3DPRESENT_INTERVAL_TWO,
+    D3DPRESENT_INTERVAL_THREE, D3DPRESENT_INTERVAL_FOUR
+};
+
+static void choose_fs_interval(D3DPRESENT_PARAMETERS *pp)
+{
+    g_hw_paced = 0;
+    read_caps_once();
+
+    if (g_vsync == 0) {                     /* vsync off: software cap only */
+        pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+        logf_("fullscreen: VSync=0 -> immediate present, software limiter caps");
+        return;
+    }
+    /* default when we cannot pace in hardware: vsync every frame (tear-free) */
+    pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+    if (g_fpscap <= 0)                       /* uncapped: just vsync once */
+        return;
+
+    DEVMODEA dm;
+    memset(&dm, 0, sizeof(dm));
+    dm.dmSize = sizeof(dm);
+    int hz = 0;
+    if (EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) &&
+        (dm.dmFields & DM_DISPLAYFREQUENCY))
+        hz = (int)dm.dmDisplayFrequency;
+    if (hz <= 1) {                           /* some drivers report 0/1 */
+        logf_("fullscreen: refresh unknown, vsync on + software limiter");
+        return;
+    }
+
+    int n = (hz + g_fpscap / 2) / g_fpscap;  /* nearest integer multiple */
+    if (n >= 1 && n <= 4 && abs(hz - n * g_fpscap) <= 2 &&
+        (g_present_intervals & k_intervals[n])) {
+        pp->FullScreen_PresentationInterval = k_intervals[n];
+        pp->FullScreen_RefreshRateInHz = 0;  /* keep the desktop refresh */
+        g_hw_paced = 1;
+        logf_("fullscreen vsync pacing: %dHz / cap %d -> present every %d "
+              "vblank(s); software limiter stands down", hz, g_fpscap, n);
+        return;
+    }
+    /* refresh not a clean multiple: pin an enumerated cap-Hz mode if there is
+     * one (present every vblank), else 2*cap-Hz (present every 2nd). */
+    if (is_refresh_mode((int)pp->BackBufferWidth,
+                        (int)pp->BackBufferHeight, g_fpscap)) {
+        pp->FullScreen_RefreshRateInHz = (UINT)g_fpscap;
+        pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_ONE;
+        g_hw_paced = 1;
+        logf_("fullscreen vsync pacing: pinned %dHz mode, present every vblank",
+              g_fpscap);
+        return;
+    }
+    if ((g_present_intervals & D3DPRESENT_INTERVAL_TWO) &&
+        is_refresh_mode((int)pp->BackBufferWidth,
+                        (int)pp->BackBufferHeight, g_fpscap * 2)) {
+        pp->FullScreen_RefreshRateInHz = (UINT)(g_fpscap * 2);
+        pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_TWO;
+        g_hw_paced = 1;
+        logf_("fullscreen vsync pacing: pinned %dHz mode, present every 2nd "
+              "vblank", g_fpscap * 2);
+        return;
+    }
+    logf_("fullscreen: %dHz is not a clean multiple of cap %d and no %d/%dHz "
+          "mode; vsync on, software limiter caps", hz, g_fpscap, g_fpscap,
+          g_fpscap * 2);
+}
+
 /* Presentation-parameters fixup: force windowed (the startup fix) and,
  * when borderless is wanted, expand to the desktop and strip the window. */
 static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
@@ -719,9 +868,12 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
         pp->Windowed = FALSE;
         pp->BackBufferFormat = D3DFMT_X8R8G8B8;
         pp->FullScreen_RefreshRateInHz = 0;   /* default refresh */
-        pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
         if (pp->SwapEffect == D3DSWAPEFFECT_COPY)
             pp->SwapEffect = D3DSWAPEFFECT_DISCARD;
+        /* Let the display pace the frame rate where it can (vsync divisor),
+         * so we get a jitter-free cap without the software limiter fighting
+         * the vsync clock. May also set FullScreen_RefreshRateInHz. */
+        choose_fs_interval(pp);
         g_borderless_active = 0;
         logf_("present fixup (%s): exclusive fullscreen %ux%u (valid mode)",
               is_reset ? "reset" : "create",
@@ -736,11 +888,16 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
 
     /* Windowed path: this is what makes CreateDevice succeed on the CrossOver
      * D3DMetal stack (the stock exclusive-fullscreen device fails with
-     * "Unable to create device"). Windowed uses the desktop format (UNKNOWN =
-     * match desktop), so there is no fullscreen mode / colour-depth match to
-     * fail. */
+     * "Unable to create device"). A windowed device renders into a backbuffer
+     * of the desktop colour format, so there is no fullscreen mode / colour-
+     * depth match to fail. The backbuffer format must be a CONCRETE desktop
+     * format, though: wined3d accepts D3DFMT_UNKNOWN (matches desktop) but
+     * native D3D8 rejects UNKNOWN for a windowed backbuffer with
+     * D3DERR_INVALIDCALL — which broke borderless on real Windows. Use the
+     * actual desktop format (queried once) so both stacks create. */
+    read_caps_once();
     pp->Windowed = TRUE;
-    pp->BackBufferFormat = D3DFMT_UNKNOWN;
+    pp->BackBufferFormat = g_desktop_fmt;
     pp->FullScreen_RefreshRateInHz = 0;
     pp->FullScreen_PresentationInterval = D3DPRESENT_INTERVAL_DEFAULT;
     if (pp->SwapEffect == D3DSWAPEFFECT_FLIP)
@@ -815,13 +972,63 @@ static void fix_projection(D3DMATRIX *m, unsigned int bbw, unsigned int bbh)
     }
 }
 
+/* High-resolution waitable timer for the limiter's bulk wait; sub-millisecond
+ * on Windows 10 1803+. Falls back to a plain timer, then to Sleep(). */
+static HANDLE g_hrtimer;
+static int g_limiter_init;
+
+static void limiter_init(void)
+{
+    if (g_limiter_init) return;
+    g_limiter_init = 1;
+    /* Raise the OS timer resolution so any Sleep()/wait is accurate to ~1ms
+     * instead of rounding to the ~15.6ms default. */
+    timeBeginPeriod(1);
+    g_hrtimer = CreateWaitableTimerExW(NULL, NULL,
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!g_hrtimer)                     /* older Windows: no high-res flag */
+        g_hrtimer = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+}
+
+/* Wait as precisely as possible until QPC reaches `deadline`. Bulk-wait with
+ * the waitable timer down to ~0.5ms, then busy-spin the final stretch with
+ * PAUSE so we hit the deadline tightly without burning a whole core. */
+static void wait_until(LONGLONG deadline, LONGLONG freq)
+{
+    for (;;) {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        LONGLONG remain = deadline - now.QuadPart;
+        if (remain <= 0) return;
+        double ms = (double)remain * 1000.0 / (double)freq;
+        if (ms > 1.5 && g_hrtimer) {
+            LARGE_INTEGER due;         /* negative = relative, 100ns units */
+            due.QuadPart = -(LONGLONG)((ms - 1.0) * 10000.0);
+            if (SetWaitableTimer(g_hrtimer, &due, 0, NULL, NULL, FALSE))
+                WaitForSingleObject(g_hrtimer, (DWORD)ms + 2);
+            else
+                Sleep((DWORD)(ms - 1.0));
+        } else if (ms > 1.5) {
+            Sleep((DWORD)(ms - 1.0));
+        } else {
+            _mm_pause();               /* final <1.5ms: spin */
+        }
+    }
+}
+
 /* Frame limiter. Hitman 2's engine advances its simulation from the measured
- * frame time, and at the hundreds of FPS a modern GPU reaches (especially
- * windowed, where there is no fullscreen vsync) the physics, animation and
- * input timing go haywire — objects fling, the camera oversteers, scripted
- * timing breaks. Capping the frame rate restores stock-like pacing. Called
- * once per presented frame by the loader. A hybrid sleep+spin holds the
- * target period accurately without burning a whole core. */
+ * frame time, so an uncapped modern GPU makes physics, camera and scripted
+ * timing run wild. We hold FpsCap once per presented frame.
+ *
+ * Pacing mode is decided ONCE, then committed: layering our own sleep on top
+ * of a hardware vsync cap of the SAME period would slowly drift and beat
+ * (periodic doubled/dropped frames — the "60fps but choppy" microstutter). So
+ * we calibrate for ~1.5s: pace precisely while measuring how often we actually
+ * had to sleep. If Present was already pacing the rate itself (hardware vsync
+ * honoured), we almost never sleep -> switch to HW mode and stop sleeping
+ * entirely. If not (e.g. a VRR/G-Sync panel strips the swap interval to
+ * immediate, as on this rig), we keep pacing precisely in software. Either way
+ * there is a single, consistent clock — no two-clock beat. */
 static void frame_limit(void)
 {
     if (g_fpscap <= 0) return;
@@ -832,35 +1039,50 @@ static void frame_limit(void)
     QueryPerformanceCounter(&now);
     if (!init) {
         QueryPerformanceFrequency(&freq);
+        limiter_init();
         next = now;
         init = 1;
     }
     if (freq.QuadPart <= 0) return;
 
     LONGLONG period = freq.QuadPart / g_fpscap;
+
+    enum { CAL, HW, SW };
+    static int mode = CAL, cal_frames, cal_slept;
+
     next.QuadPart += period;
-    /* If we fell more than one frame behind (alt-tab, a hitch), resync so we
-     * do not "catch up" by running unbounded fast frames. */
-    if (next.QuadPart < now.QuadPart)
+    if (next.QuadPart < now.QuadPart)   /* fell >1 frame behind: resync */
         next.QuadPart = now.QuadPart + period;
 
-    for (;;) {
-        QueryPerformanceCounter(&now);
-        LONGLONG remain = next.QuadPart - now.QuadPart;
-        if (remain <= 0) break;
-        DWORD ms = (DWORD)((remain * 1000) / freq.QuadPart);
-        if (ms > 1)
-            Sleep(ms - 1);        /* coarse wait, leave the last ~1ms to spin */
-        else
-            Sleep(0);             /* yield the rest of the timeslice */
+    if (mode == HW) {                   /* display paces; never sleep */
+        next = now;
+        return;
+    }
+
+    /* CAL and SW both pace precisely. In CAL, note whether we had to sleep. */
+    wait_until(next.QuadPart, freq.QuadPart);
+
+    if (mode == CAL) {
+        LARGE_INTEGER after;
+        QueryPerformanceCounter(&after);
+        if (after.QuadPart - now.QuadPart > period / 8)   /* slept >~1/8 frame */
+            cal_slept++;
+        if (++cal_frames >= 90) {
+            mode = (cal_slept <= 5) ? HW : SW;
+            logf_("frame pacing: %s (slept %d/%d calibration frames, cap %d)",
+                  mode == HW ? "display/vsync — software limiter OFF"
+                             : "precise software limiter",
+                  cal_slept, cal_frames, g_fpscap);
+        }
     }
 
     /* Log the measured rate for the first few seconds so a run confirms the
-     * cap engaged, then go quiet (no unbounded log growth). */
+     * cap engaged, then go quiet. */
     static int samples;
     static LARGE_INTEGER win_start;
     static long frames;
     if (samples < 5) {
+        QueryPerformanceCounter(&now);
         frames++;
         if (win_start.QuadPart == 0)
             win_start = now;
@@ -906,10 +1128,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         if (g_enabled)
             CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
         logf_("H2SA Widescreen loaded%s, Fullscreen=%d Borderless=%d "
-              "FOVCorrect=%d FOVFactor=%.2f FpsCap=%d, Hitman2.ini "
+              "FOVCorrect=%d FOVFactor=%.2f FpsCap=%d VSync=%d, Hitman2.ini "
               "resolution %dx%d", g_enabled ? "" : " (disabled)",
               g_fullscreen, g_borderless, g_fovcorrect, (double)g_fovfactor,
-              g_fpscap, g_ini_w, g_ini_h);
+              g_fpscap, g_vsync, g_ini_w, g_ini_h);
 
         HMODULE loader = GetModuleHandleA("d3d8.dll");
         h2sa_register_fn reg = loader ? (h2sa_register_fn)(uintptr_t)

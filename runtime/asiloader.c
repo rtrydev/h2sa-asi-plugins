@@ -212,6 +212,25 @@ static HRESULT WINAPI hook_CreateDevice(IDirect3D8 *self, UINT Adapter,
         hFocusWindow, BehaviorFlags, pp, ppReturnedDeviceInterface);
     logf_("CreateDevice returned 0x%08lx", (unsigned long)hr);
 
+    /* Reliability: an exclusive-fullscreen CreateDevice can fail transiently
+     * with D3DERR_NOTAVAILABLE / D3DERR_DEVICELOST during a display-state race
+     * (VRR/G-Sync renegotiation, an HDR toggle, the Steam overlay or another
+     * app briefly owning the display) — the "this render mode is not available"
+     * crash that comes and goes. Retry the same request a few times with a
+     * short delay before giving up, turning a flaky start into a reliable one.
+     * Windowed requests always create, so this only guards the fullscreen path. */
+    if (pp && !pp->Windowed) {
+        for (int tries = 0; FAILED(hr) && tries < 5 &&
+             (hr == D3DERR_NOTAVAILABLE || hr == D3DERR_DEVICELOST); tries++) {
+            logf_("fullscreen CreateDevice failed 0x%08lx — retry %d after 80ms",
+                  (unsigned long)hr, tries + 1);
+            Sleep(80);
+            hr = ((cd_t)g_orig_createdevice)(self, Adapter, DeviceType,
+                hFocusWindow, BehaviorFlags, pp, ppReturnedDeviceInterface);
+            logf_("fullscreen CreateDevice retry -> 0x%08lx", (unsigned long)hr);
+        }
+    }
+
     if (SUCCEEDED(hr) && ppReturnedDeviceInterface &&
         *ppReturnedDeviceInterface) {
         if (pp) { g_bbw = pp->BackBufferWidth; g_bbh = pp->BackBufferHeight; }

@@ -20,7 +20,7 @@ all: ../dist/d3d8.dll ../dist/H2SAWidescreen.asi
 
 ../dist/H2SAWidescreen.asi: widescreen.c h2sa_d3d8.h
 	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ widescreen.c $(LDFLAGS) -luser32 -lgdi32
+	$(CC) $(CFLAGS) -o $@ widescreen.c $(LDFLAGS) -luser32 -lgdi32 -lwinmm
 
 clean:
 	rm -f ../dist/d3d8.dll ../dist/H2SAWidescreen.asi
