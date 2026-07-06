@@ -185,25 +185,66 @@ by `install.sh`) once the window is active. If you specifically want the old
 cursor-hide / startup-activation behaviour back, set `CursorFix=1` (or `-1`
 for auto-on under Wine).
 
-A separate, unrelated quirk you may still notice: the in-menu pointer can
-occasionally feel "heavy" on one axis. That is winemac's DirectInput mouse
-handling (`UseDirectInputMouse` in `Hitman2.ini`), not this plugin — no plugin
-code touches the cursor with `CursorFix=0`.
+### Mouse-look under winemac (CrossOver)
+
+Camera mouse-look needs **two** winemac fixes (both **auto-on under Wine**), the
+same pair the sibling *Hitman: Contracts* port needed — H2 turns out to read its
+mouse identically. Symptoms without them: the camera pins against an invisible
+wall looking right/down, and slow turns stall until you shove the mouse harder.
+
+**`MouseClipFix` — the edge wall.** `RenderD3D` captures the pointer for
+camera-look by clipping the OS cursor to its full client rect (`GetClientRect` →
+`ClientToScreen` → `ClipCursor`). Because the borderless window covers the whole
+desktop, that clip equals the **entire display** — which winemac treats as *not
+clipping*, leaving the Mac pointer in **absolute** mode where the reported
+position clamps at the screen edges. Push right or down and the position pins at
+the edge and the camera stops dead. winemac only switches the pointer to
+**relative** mode (warps honoured, motion unbounded) when the clip is a *strict
+subset* of the display, so the fix intercepts `ClipCursor` on `RenderD3D.dll` and
+insets any full-screen clip by 2px. A `NULL` (release) clip — menus — is passed
+straight through.
+
+**`MouseMotionFix` — the slow-move stall.** The mission camera (and the menu
+pointer) read the mouse through **DirectInput 8** in immediate mode
+(`GetDeviceState` → `DIMOUSESTATE2`). DirectInput's *relative* axis is lossy on
+winemac: it gets an integer per-event delta from the accelerated macOS `CGEvent`
+stream, so a slow move rounds to **zero every event** and the camera stalls until
+you cross a whole pixel in one event. The win32 `GetCursorPos` position does *not*
+lose this — winemac accumulates the fractional motion into the absolute cursor
+and rounds the **sum** — so the fix keeps the DirectInput device (buttons/firing
+untouched) but, while camera-look is active, **replaces the device's lX/lY with
+motion derived from `GetCursorPos`**, recentring each read. It pairs with
+`MouseClipFix`: the clip inset puts winemac in relative mode so `GetCursorPos` is
+smooth and the recentre warp is honoured.
+
+Because the packed `hitman2.exe` creates its DirectInput device before the plugin
+loads (and resolves DirectInput at runtime, so there is no static import to
+hook), the fix reaches the device's methods via the **shared COM vtable**: it
+creates its own throwaway SysMouse device — DirectInput objects of one class
+share a single vtable — patches `GetDeviceState`/`GetDeviceData` there, and
+releases it; the game's existing device then routes through the hooks. No game
+byte-offsets. (H2's `p5dll.dll` HID import drives the exotic **P5 data glove**,
+not the mouse — a red herring.) Set either to `0` to disable (both are off by
+default on real Windows, which needs neither).
 
 Config: `scripts/H2SAWidescreen.ini`
 
 ```ini
 [Widescreen]
 Enabled=1
-Fullscreen=0    ; 1 = exclusive fullscreen (real Windows only, at an
-                ; enumerated mode); on Wine/Mac -> borderless-fullscreen
-Borderless=-1   ; when not fullscreen: -1 auto = borderless fills desktop
-                ; (all platforms), 0 plain window, 1 always borderless
-FOVCorrect=1    ; Hor+ projection correction on/off
-FOVFactor=1.0   ; extra horizontal FOV multiplier (>1 = wider)
-CursorFix=0     ; hide stray macOS cursor + startup activation: 0 off
-                ; (default), 1 on, -1 auto (on under Wine)
-FpsCap=60       ; frame-rate cap; 0 = uncapped (see below)
+Fullscreen=0      ; 1 = exclusive fullscreen (real Windows only, at an
+                  ; enumerated mode); on Wine/Mac -> borderless-fullscreen
+Borderless=-1     ; when not fullscreen: -1 auto = borderless fills desktop
+                  ; (all platforms), 0 plain window, 1 always borderless
+FOVCorrect=1      ; Hor+ projection correction on/off
+FOVFactor=1.0     ; extra horizontal FOV multiplier (>1 = wider)
+CursorFix=0       ; hide stray macOS cursor + startup activation: 0 off
+                  ; (default), 1 on, -1 auto (on under Wine)
+FpsCap=60         ; frame-rate cap; 0 = uncapped (see below)
+MouseClipFix=-1   ; fix the mouse-look edge wall (inset the renderer's full-
+                  ; window cursor clip): -1 auto (on under Wine), 0 off, 1 on
+MouseMotionFix=-1 ; fix the slow-move stall (feed the DirectInput camera from
+                  ; GetCursorPos): -1 auto (on under Wine), 0 off, 1 on
 ```
 
 ### Frame-rate cap
