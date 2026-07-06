@@ -17,6 +17,7 @@ if [ "$1" = "-u" ]; then
     rm -f "$GAME/scripts/H2SAWidescreen.asi"
     rm -f "$GAME/scripts/H2SAWidescreen.log"
     rm -f "$GAME/scripts/H2SAReducedX87.asi"
+    rm -f "$GAME/scripts/H2SAReducedX87-diag.asi"
     rm -f "$GAME/scripts/H2SAReducedX87.log"
     rm -rf "$GAME/scripts/H2SAReducedX87"
     rm -f "$GAME/scripts/H2SAProfiler.asi"
@@ -48,6 +49,9 @@ fi
 # performance. The .asi loads any <module>.x87 blob from scripts/H2SAReducedX87/.
 if [ -f "$HERE/dist/H2SAReducedX87.asi" ] && [ -f "$HERE/dist/RenderD3D.dll.x87" ]; then
     cp "$HERE/dist/H2SAReducedX87.asi" "$GAME/scripts/"
+    # a stray diag build would win the *.asi load race (- sorts before .) and
+    # hook the game with helper-call counting overhead; never leave one behind
+    rm -f "$GAME/scripts/H2SAReducedX87-diag.asi"
     mkdir -p "$GAME/scripts/H2SAReducedX87"
     cp "$HERE/dist/RenderD3D.dll.x87" "$GAME/scripts/H2SAReducedX87/"
     msg="RenderD3D.dll.x87"

@@ -446,16 +446,78 @@ static Vtx    g_vtx[MAX_VTX];
 static int    g_nvtx;
 
 #define VT(dev, idx, T) ((T)(*(void ***)(dev))[idx])
-typedef HRESULT (STDMETHODCALLTYPE *CreateSB_t)(IDirect3DDevice8*, D3DSTATEBLOCKTYPE, DWORD*);
-typedef HRESULT (STDMETHODCALLTYPE *ApplySB_t)(IDirect3DDevice8*, DWORD);
-typedef HRESULT (STDMETHODCALLTYPE *DeleteSB_t)(IDirect3DDevice8*, DWORD);
 typedef HRESULT (STDMETHODCALLTYPE *SetRS_t)(IDirect3DDevice8*, D3DRENDERSTATETYPE, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetRS_t)(IDirect3DDevice8*, D3DRENDERSTATETYPE, DWORD*);
 typedef HRESULT (STDMETHODCALLTYPE *SetTex_t)(IDirect3DDevice8*, DWORD, IDirect3DBaseTexture8*);
+typedef HRESULT (STDMETHODCALLTYPE *GetTex_t)(IDirect3DDevice8*, DWORD, IDirect3DBaseTexture8**);
 typedef HRESULT (STDMETHODCALLTYPE *SetTSS_t)(IDirect3DDevice8*, DWORD, D3DTEXTURESTAGESTATETYPE, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetTSS_t)(IDirect3DDevice8*, DWORD, D3DTEXTURESTAGESTATETYPE, DWORD*);
 typedef HRESULT (STDMETHODCALLTYPE *SetVS_t)(IDirect3DDevice8*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetVS_t)(IDirect3DDevice8*, DWORD*);
 typedef HRESULT (STDMETHODCALLTYPE *SetPS_t)(IDirect3DDevice8*, DWORD);
+typedef HRESULT (STDMETHODCALLTYPE *GetPS_t)(IDirect3DDevice8*, DWORD*);
+typedef HRESULT (STDMETHODCALLTYPE *SetSS_t)(IDirect3DDevice8*, UINT, IDirect3DVertexBuffer8*, UINT);
+typedef HRESULT (STDMETHODCALLTYPE *GetSS_t)(IDirect3DDevice8*, UINT, IDirect3DVertexBuffer8**, UINT*);
 typedef HRESULT (STDMETHODCALLTYPE *GetVP_t)(IDirect3DDevice8*, D3DVIEWPORT8*);
 typedef HRESULT (STDMETHODCALLTYPE *DrawUP_t)(IDirect3DDevice8*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+
+/* Exactly the device state draw() touches. A per-frame
+ * CreateStateBlock(D3DSBT_ALL) capture/apply/delete makes wined3d snapshot
+ * and replay the whole device state every frame — needless main-thread cost
+ * under CrossOver. Save/restore only what we change (plus stream 0, which
+ * DrawPrimitiveUP invalidates). */
+static const D3DRENDERSTATETYPE k_saved_rs[] = {
+    D3DRS_LIGHTING, D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_CULLMODE,
+    D3DRS_ALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_FOGENABLE,
+};
+#define N_SAVED_RS (sizeof(k_saved_rs) / sizeof(k_saved_rs[0]))
+static const D3DTEXTURESTAGESTATETYPE k_saved_tss[] = {
+    D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_ALPHAOP, D3DTSS_ALPHAARG1,
+};
+#define N_SAVED_TSS (sizeof(k_saved_tss) / sizeof(k_saved_tss[0]))
+
+typedef struct {
+    DWORD rs[N_SAVED_RS];
+    DWORD tss[N_SAVED_TSS];
+    IDirect3DBaseTexture8 *tex;      /* AddRef'd by GetTexture      */
+    IDirect3DVertexBuffer8 *stream0; /* AddRef'd by GetStreamSource */
+    UINT stream0_stride;
+    DWORD vs, ps;
+} SavedState;
+
+static void save_device_state(IDirect3DDevice8 *dev, SavedState *s)
+{
+    GetRS_t getRS  = VT(dev, 51, GetRS_t);
+    GetTSS_t getTSS = VT(dev, 62, GetTSS_t);
+    for (size_t i = 0; i < N_SAVED_RS; i++)
+        getRS(dev, k_saved_rs[i], &s->rs[i]);
+    for (size_t i = 0; i < N_SAVED_TSS; i++)
+        getTSS(dev, 0, k_saved_tss[i], &s->tss[i]);
+    VT(dev, 60, GetTex_t)(dev, 0, &s->tex);
+    VT(dev, 84, GetSS_t)(dev, 0, &s->stream0, &s->stream0_stride);
+    VT(dev, 77, GetVS_t)(dev, &s->vs);
+    VT(dev, 89, GetPS_t)(dev, &s->ps);
+}
+
+static void restore_device_state(IDirect3DDevice8 *dev, SavedState *s)
+{
+    SetRS_t setRS  = VT(dev, 50, SetRS_t);
+    SetTSS_t setTSS = VT(dev, 63, SetTSS_t);
+    for (size_t i = 0; i < N_SAVED_RS; i++)
+        setRS(dev, k_saved_rs[i], s->rs[i]);
+    for (size_t i = 0; i < N_SAVED_TSS; i++)
+        setTSS(dev, 0, k_saved_tss[i], s->tss[i]);
+    VT(dev, 61, SetTex_t)(dev, 0, s->tex);
+    VT(dev, 83, SetSS_t)(dev, 0, s->stream0, s->stream0_stride);
+    VT(dev, 76, SetVS_t)(dev, s->vs);
+    VT(dev, 88, SetPS_t)(dev, s->ps);
+    /* the Get* calls AddRef'd these; Release = vtable slot 2 */
+    typedef ULONG (STDMETHODCALLTYPE *Release_t)(void *);
+    if (s->tex)     VT(s->tex, 2, Release_t)(s->tex);
+    if (s->stream0) VT(s->stream0, 2, Release_t)(s->stream0);
+    s->tex = NULL;
+    s->stream0 = NULL;
+}
 
 static void add_rect(float x, float y, float w, float h, DWORD c)
 {
@@ -540,10 +602,10 @@ static void draw(IDirect3DDevice8 *dev)
 
     if (!g_nvtx) return;
 
-    /* save all device state, set 2D untextured alpha-blended draw, restore */
-    DWORD sb = 0;
-    CreateSB_t createSB = VT(dev, 57, CreateSB_t);
-    if (!createSB || FAILED(createSB(dev, D3DSBT_ALL, &sb))) sb = 0;
+    /* save the touched device state, set 2D untextured alpha-blended draw,
+     * restore */
+    SavedState saved = {0};
+    save_device_state(dev, &saved);
 
     SetRS_t setRS = VT(dev, 50, SetRS_t);
     setRS(dev, D3DRS_LIGHTING, FALSE);
@@ -565,10 +627,7 @@ static void draw(IDirect3DDevice8 *dev)
 
     VT(dev, 72, DrawUP_t)(dev, D3DPT_TRIANGLELIST, g_nvtx / 3, g_vtx, sizeof(Vtx));
 
-    if (sb) {
-        VT(dev, 54, ApplySB_t)(dev, sb);
-        VT(dev, 56, DeleteSB_t)(dev, sb);
-    }
+    restore_device_state(dev, &saved);
 }
 
 /* ------------------------------------------------------------------ */
