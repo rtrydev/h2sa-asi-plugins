@@ -1451,8 +1451,14 @@ static void frame_limit(void)
     static int mode = CAL, cal_frames, cal_slept;
 
     next.QuadPart += period;
-    if (next.QuadPart < now.QuadPart)   /* fell >1 frame behind: resync */
-        next.QuadPart = now.QuadPart + period;
+    if (next.QuadPart < now.QuadPart) {
+        /* Frame work overran the cap period — the deadline already passed.
+         * Present immediately and restart the schedule from now. Waiting
+         * until now+period here would tax every over-budget frame a full
+         * extra period (17ms of work -> 33.7ms frame), cliffing heavy
+         * scenes (gunfights, crowds) from 60 straight to ~30fps. */
+        next.QuadPart = now.QuadPart;
+    }
 
     if (mode == HW) {                   /* display paces; never sleep */
         next = now;

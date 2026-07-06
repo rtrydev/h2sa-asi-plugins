@@ -114,11 +114,18 @@ typedef struct {
 typedef struct { uint32_t rva, blob_off, blob_len, fixup_idx, n_fixups; } FuncRec;
 #pragma pack(pop)
 
-/* first few translated func rvas, to follow the installed 5-byte jmp hook */
-static uint32_t g_probe_rva[8];
-static int      g_n_probe;
-static uint32_t g_blob_total;
-static char     g_blob_module[32];
+/* One record per installed .x87 patch (RenderD3D.dll + hitman2.exe). The
+ * first translated function's rva lets us follow the 5-byte jmp hook the
+ * loader installs at its entry to find where the SSE2 blob was allocated. */
+#define MAX_BLOBS 4
+typedef struct {
+    char     module[32];    /* module the patch belongs to (from header) */
+    uint32_t probe_rva;     /* rva of the first translated function      */
+    uint32_t blob_total;
+    uint32_t base;          /* 0 until located via the entry hook        */
+} Blob;
+static Blob g_blobs[MAX_BLOBS];
+static int  g_n_blobs;
 
 static void load_blob_desc(void)
 {
@@ -130,26 +137,29 @@ static void load_blob_desc(void)
         logf_("no .x87 patch file — X87 attribution disabled");
         return;
     }
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\H2SAReducedX87\\%s", g_dir, fd.cFileName);
-    FindClose(fh);
-    FILE *f = fopen(path, "rb");
-    if (!f) return;
-    PatchHeader h;
-    if (fread(&h, sizeof(h), 1, f) != 1 ||
-        memcmp(h.magic, "H2SAX87P", 8) || !h.n_funcs) { fclose(f); return; }
-    g_blob_total = h.blob_total;
-    memcpy(g_blob_module, h.module, 32);
-    g_blob_module[31] = 0;
-    uint32_t want = h.n_funcs < 8 ? h.n_funcs : 8;
-    for (uint32_t i = 0; i < want; i++) {
+    do {
+        if (g_n_blobs >= MAX_BLOBS) break;
+        char path[MAX_PATH];
+        snprintf(path, sizeof(path), "%s\\H2SAReducedX87\\%s", g_dir,
+                 fd.cFileName);
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        PatchHeader h;
         FuncRec fr;
-        if (fread(&fr, sizeof(fr), 1, f) != 1) break;
-        g_probe_rva[g_n_probe++] = fr.rva;
-    }
-    fclose(f);
-    logf_("blob desc: %s, %lu KB, %d probe rvas", g_blob_module,
-          (unsigned long)g_blob_total / 1024, g_n_probe);
+        if (fread(&h, sizeof(h), 1, f) == 1 &&
+            !memcmp(h.magic, "H2SAX87P", 8) && h.n_funcs &&
+            fread(&fr, sizeof(fr), 1, f) == 1) {
+            Blob *b = &g_blobs[g_n_blobs++];
+            memcpy(b->module, h.module, 32);
+            b->module[31] = 0;
+            b->probe_rva = fr.rva;
+            b->blob_total = h.blob_total;
+            logf_("blob desc: %s, %lu KB", b->module,
+                  (unsigned long)b->blob_total / 1024);
+        }
+        fclose(f);
+    } while (FindNextFileA(fh, &fd));
+    FindClose(fh);
 }
 
 /* ------------------------------------------------------------------ */
@@ -157,7 +167,6 @@ static void load_blob_desc(void)
 /* ------------------------------------------------------------------ */
 static uint32_t g_rd3d_base, g_rd3d_size;
 static uint32_t g_game_base, g_game_size;
-static uint32_t g_blob_base;    /* 0 until located via the entry hooks */
 
 static void module_range(const char *name, uint32_t *base, uint32_t *size)
 {
@@ -171,15 +180,24 @@ static void module_range(const char *name, uint32_t *base, uint32_t *size)
 }
 
 /* The first translated function is emitted at blob_off 0, so the target of
- * the 5-byte jmp H2SAReducedX87 installed at its entry IS the blob base. */
-static void locate_blob(void)
+ * the 5-byte jmp H2SAReducedX87 installed at its entry IS the blob base.
+ * Each patch is resolved against the module NAMED IN ITS HEADER — following
+ * hitman2.exe rvas inside RenderD3D reads the wrong (possibly unmapped)
+ * bytes and mis-attributes all blob samples to REST. */
+static void locate_blobs(void)
 {
-    if (g_blob_base || !g_n_probe || !g_rd3d_base) return;
-    uint8_t *entry = (uint8_t *)(uintptr_t)g_rd3d_base + g_probe_rva[0];
-    if (entry[0] != 0xE9) return;       /* not hooked yet */
-    g_blob_base = (uint32_t)(uintptr_t)(entry + 5) + *(int32_t *)(entry + 1);
-    logf_("translated blob located at %08x (+%lu KB)", g_blob_base,
-          (unsigned long)g_blob_total / 1024);
+    for (int i = 0; i < g_n_blobs; i++) {
+        Blob *b = &g_blobs[i];
+        if (b->base) continue;
+        uint32_t mbase, msize;
+        module_range(b->module, &mbase, &msize);
+        if (!mbase || b->probe_rva + 5 > msize) continue;
+        uint8_t *entry = (uint8_t *)(uintptr_t)mbase + b->probe_rva;
+        if (entry[0] != 0xE9) continue;     /* not hooked yet */
+        b->base = (uint32_t)(uintptr_t)(entry + 5) + *(int32_t *)(entry + 1);
+        logf_("%s translated blob located at %08x (+%lu KB)", b->module,
+              b->base, (unsigned long)b->blob_total / 1024);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -211,7 +229,9 @@ static volatile int    g_run = 1;
 
 static int classify(uint32_t eip)
 {
-    if (g_blob_base && eip - g_blob_base < g_blob_total) return CAT_X87;
+    for (int i = 0; i < g_n_blobs; i++)
+        if (g_blobs[i].base && eip - g_blobs[i].base < g_blobs[i].blob_total)
+            return CAT_X87;
     if (g_rd3d_base && eip - g_rd3d_base < g_rd3d_size)  return CAT_REND;
     if (g_game_base && eip - g_game_base < g_game_size)  return CAT_GAME;
     return CAT_REST;
@@ -301,7 +321,7 @@ static DWORD WINAPI sampler(LPVOID arg)
             last_refresh = now;
             module_range("RenderD3D.dll", &g_rd3d_base, &g_rd3d_size);
             module_range("hitman2.exe",   &g_game_base, &g_game_size);
-            locate_blob();
+            locate_blobs();
             refresh_mods();
         }
         HANDLE rt = g_render_th;
