@@ -2,7 +2,7 @@
 
 ASI plugins and a bundled ASI loader for **Hitman 2: Silent Assassin** on
 modern systems, especially CrossOver/Rosetta 2 on Apple Silicon Macs. It is
-the sibling of the [Hitman: Codename 47 build](../hc47-asi-plugins); the two
+the sibling of the [Hitman: Codename 47 build](https://github.com/rtrydev/hc47-asi-plugins); the two
 games are close relatives but Hitman 2 is a **Direct3D 8** title, which
 changes how the loader attaches and how the widescreen/startup fix is done.
 
