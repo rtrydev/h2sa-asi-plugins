@@ -44,6 +44,9 @@
  *                   ; enumerated mode); on Wine/Mac -> borderless-fullscreen
  *   Borderless=-1   ; when not fullscreen: -1 auto (borderless, filling the
  *                   ; desktop, under Wine), 0 plain window, 1 always borderless
+ *   PreserveAspect=1 ; borderless: keep the Hitman2.ini resolution's aspect
+ *                   ; ratio — scale to the largest centred fit and fill the
+ *                   ; rest of the screen with black bars; 0 = stretch to fill
  *   FOVCorrect=1    ; Hor+ projection correction on/off
  *   FOVFactor=1.0   ; extra horizontal FOV multiplier (>1 = wider)
  *   CursorFix=0     ; hide the host (Mac) cursor over the game: 0 off
@@ -90,6 +93,9 @@ static D3DFORMAT g_desktop_fmt = D3DFMT_X8R8G8B8; /* desktop backbuffer format *
 static int g_caps_done;             /* caps queried yet? */
 static volatile int g_hw_paced;     /* display (vsync divisor) paces the rate */
 static int g_borderless_active;    /* a fullscreen request was converted */
+static int g_preserveaspect = 1;   /* borderless: keep the backbuffer aspect
+                                    * (largest centred fit + black bars) instead
+                                    * of stretching to the screen; 0 = stretch */
 static int g_ini_w, g_ini_h;       /* Resolution WxH parsed from Hitman2.ini */
 static int g_cursorfix = 0;        /* 0 off (default), 1 on, -1 auto (Wine).
                                     * Off by default: in borderless/fullscreen
@@ -149,6 +155,9 @@ static void read_config(void)
         else if (sscanf(line, " MouseMotionFix = %d", &b) == 1 ||
                  sscanf(line, " MouseMotionFix=%d", &b) == 1)
             g_mousemotionfix = b < 0 ? -1 : (b != 0);
+        else if (sscanf(line, " PreserveAspect = %d", &b) == 1 ||
+                 sscanf(line, " PreserveAspect=%d", &b) == 1)
+            g_preserveaspect = (b != 0);
         else if (sscanf(line, " FOVCorrect = %d", &b) == 1 ||
                  sscanf(line, " FOVCorrect=%d", &b) == 1)
             g_fovcorrect = b;
@@ -978,6 +987,8 @@ static BOOL CALLBACK hook_thread_of_window(HWND w, LPARAM lp)
 #define GCL_HCURSOR (-12)
 #endif
 
+static void backdrop_maintain(void);   /* letterbox upkeep, defined below */
+
 /* Supervisor thread: installs the in-thread hooks as the game's windows and
  * threads appear, and keeps the game window's CLASS cursor NULL so
  * DefWindowProc's WM_SETCURSOR handling cannot install a real cursor. It
@@ -991,6 +1002,8 @@ static DWORD WINAPI cursor_watch(LPVOID arg)
         hook_game_imports();
         hook_clipcursor();   /* edge-wall fix; wanted even with CursorFix off */
         hook_dinput();       /* slow-move fix: feed DI mouse from GetCursorPos */
+        if ((tick % 25) == 0)          /* every ~500ms */
+            backdrop_maintain();       /* keep letterbox bars black + beneath */
         if (!cursorfix_wanted())
             continue;
         if ((tick % 10) == 0)          /* rescan for new threads at 5 Hz */
@@ -1058,6 +1071,116 @@ static void set_borderless_window(HWND hwnd, int x, int y, int w, int h)
     g_fg_deadline = GetTickCount() + 20000;
     logf_("window %p -> borderless popup %dx%d at %d,%d (activation queued)",
           (void *)hwnd, w, h, x, y);
+}
+
+/* Letterbox backdrop: preserving the backbuffer aspect makes the game window
+ * SMALLER than the screen, and the leftover strips must be black. A separate
+ * full-screen black window behind the game window supplies them. Design
+ * constraints on this stack:
+ *
+ *  - It is created on the game's own thread (fix_present runs there on
+ *    CreateDevice/Reset), and painted directly with GetDC+FillRect so the
+ *    bars never depend on anyone dispatching WM_PAINT for it (macOS keeps
+ *    the painted backing store).
+ *  - It is sized 1px past the screen's right/bottom edges — with the game
+ *    window letterboxed, the BACKDROP is now the window at the screen edges,
+ *    so it inherits the winemac NSMouseInRect edge case (a pointer pinned on
+ *    the exact bottom/right boundary counts as "outside", flashing the host
+ *    arrow) that the full-fill window worked around the same way.
+ *  - Keeping a fullscreen-SIZED window in the app also keeps winemac's
+ *    fullscreen treatment engaged (hidden menu bar, raised window level)
+ *    now that the game window itself no longer covers the screen; winemac's
+ *    level adjustment keeps windows stacked above it at least as high, so
+ *    the game window in front is not swallowed. */
+static HINSTANCE g_inst;
+static HWND g_backdrop;
+
+static void backdrop_paint(HWND w)
+{
+    RECT rc;
+    HDC dc = w ? GetDC(w) : NULL;
+    if (!dc) return;
+    if (GetClientRect(w, &rc))
+        FillRect(dc, &rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    ReleaseDC(w, dc);
+    /* Clear the update region: nothing else paints this window, so a pending
+     * WM_PAINT would otherwise stay pending forever and keep the "needs
+     * repainting?" check in backdrop_maintain firing every tick. */
+    ValidateRect(w, NULL);
+}
+
+/* Create (once) / size / show the backdrop and slot it directly beneath the
+ * game window. Runs on the game thread from fix_present. */
+static void backdrop_show(HWND game, int dw, int dh)
+{
+    if (!g_backdrop) {
+        static int cls_done;
+        if (!cls_done) {
+            WNDCLASSA wc;
+            memset(&wc, 0, sizeof(wc));
+            wc.lpfnWndProc = DefWindowProcA;
+            wc.hInstance = g_inst;
+            wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+            /* hCursor stays NULL so hovering the bars cannot re-arm a cursor */
+            wc.lpszClassName = "H2SALetterbox";
+            RegisterClassA(&wc);
+            cls_done = 1;
+        }
+        g_backdrop = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                     "H2SALetterbox", "", WS_POPUP,
+                                     0, 0, dw + 1, dh + 1,
+                                     NULL, NULL, g_inst, NULL);
+        if (!g_backdrop) {
+            logf_("letterbox backdrop CreateWindow FAILED (%lu)",
+                  (unsigned long)GetLastError());
+            return;
+        }
+        logf_("letterbox backdrop %p created (%dx%d)", (void *)g_backdrop,
+              dw + 1, dh + 1);
+    }
+    SetWindowPos(g_backdrop, game, 0, 0, dw + 1, dh + 1,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    backdrop_paint(g_backdrop);
+}
+
+static void backdrop_hide(void)
+{
+    if (g_backdrop && IsWindowVisible(g_backdrop))
+        ShowWindow(g_backdrop, SW_HIDE);
+}
+
+/* Periodic upkeep from the watcher thread (~2Hz). In the steady state this
+ * must be QUERIES ONLY: an earlier revision unconditionally refilled the
+ * full-screen backdrop (a multi-MB winemac surface flush on the Cocoa main
+ * thread, where presents also run) and re-slotted it with SetWindowPos on
+ * every tick (the "directly beneath?" check compared against GW_HWNDNEXT,
+ * which any INVISIBLE window between the two defeats, so it never settled
+ * and winemac reshuffled its window order at 2Hz) — together a rhythmic
+ * in-game stutter. Now: repaint only when something actually invalidated
+ * the backdrop, and re-slot only when it is not below the game window at
+ * all (invisible in-between windows cover nothing and are fine). */
+static void backdrop_maintain(void)
+{
+    HWND b = g_backdrop, g = g_game_hwnd;
+    if (!b || !g || !IsWindowVisible(b) || !IsWindow(g)) return;
+
+    int below = 0;
+    HWND w = g;
+    for (int i = 0; i < 64 && (w = GetWindow(w, GW_HWNDNEXT)) != NULL; i++)
+        if (w == b) { below = 1; break; }
+    if (!below) {
+        SetWindowPos(b, g, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE |
+                     SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        static LONG logs;
+        if (logs < 8) {
+            InterlockedIncrement(&logs);
+            logf_("letterbox backdrop re-slotted below the game window");
+        }
+    }
+
+    RECT upd;
+    if (GetUpdateRect(b, &upd, FALSE))
+        backdrop_paint(b);       /* validates, so it doesn't refire */
 }
 
 /* Is w x h an exact 32-bit display mode the driver enumerates? Exclusive
@@ -1266,6 +1389,7 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
          * the vsync clock. May also set FullScreen_RefreshRateInHz. */
         choose_fs_interval(pp);
         g_borderless_active = 0;
+        backdrop_hide();
         logf_("present fixup (%s): exclusive fullscreen %ux%u (valid mode)",
               is_reset ? "reset" : "create",
               pp->BackBufferWidth, pp->BackBufferHeight);
@@ -1317,29 +1441,66 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
     int dw = GetSystemMetrics(SM_CXSCREEN);
     int dh = GetSystemMetrics(SM_CYSCREEN);
     HWND hwnd = devwnd;
+    int letterbox = 0;
     if (g_borderless_active && dw >= 320 && dh >= 200 && hwnd) {
         /* Keep the backbuffer at the Hitman2.ini resolution (now honoured
-         * end-to-end thanks to the snap patch) and stretch it across a
-         * full-desktop borderless window. Set Resolution to your display
-         * resolution for a pixel-exact, unstretched fill.
+         * end-to-end thanks to the snap patch) and scale it across a
+         * borderless window. With PreserveAspect (default) the window is the
+         * largest centred rect OF THE BACKBUFFER'S ASPECT that fits the
+         * screen, and a full-screen black backdrop window supplies the
+         * letterbox/pillarbox bars — nothing is stretched. PreserveAspect=0
+         * stretches to fill the desktop as before.
          *
-         * The window is oversized by one pixel on the right and bottom: the
-         * Mac driver treats a pointer on a window frame's exact bottom/right
-         * boundary as OUTSIDE the window (Cocoa's NSMouseInRect excludes
-         * those two edges), and for a point over "no Wine window" it resets
-         * to the host arrow cursor and unhides it — so a cursor pinned at
-         * the bottom of the screen flashed the macOS arrow in the menus.
-         * With the frame 1px past the screen edge the pinned cursor stays
-         * strictly inside. The extra pixel is off-screen and the stretch
-         * difference is imperceptible. */
-        set_borderless_window(hwnd, 0, 0, dw + 1, dh + 1);
+         * The stretch-fill window is oversized by one pixel on the right and
+         * bottom: the Mac driver treats a pointer on a window frame's exact
+         * bottom/right boundary as OUTSIDE the window (Cocoa's NSMouseInRect
+         * excludes those two edges), and for a point over "no Wine window"
+         * it resets to the host arrow cursor and unhides it — so a cursor
+         * pinned at the bottom of the screen flashed the macOS arrow in the
+         * menus. With the frame 1px past the screen edge the pinned cursor
+         * stays strictly inside. The extra pixel is off-screen and the
+         * stretch difference is imperceptible. (When letterboxing, the
+         * BACKDROP covers the screen edges and carries the same +1 instead.) */
+        int tx = 0, ty = 0, tw = dw + 1, th = dh + 1;
+        if (g_preserveaspect && pp->BackBufferWidth && pp->BackBufferHeight) {
+            double img = (double)pp->BackBufferWidth /
+                         (double)pp->BackBufferHeight;
+            double scr = (double)dw / (double)dh;
+            /* aspects within 1% -> treat as matching, no bars */
+            if (fabs(img - scr) > 0.01 * scr) {
+                if (img > scr) {          /* wider than screen: bars top+bottom */
+                    tw = dw;
+                    th = (int)((double)dw / img + 0.5);
+                } else {                  /* narrower: bars left+right */
+                    th = dh;
+                    tw = (int)((double)dh * img + 0.5);
+                }
+                if (tw < 1) tw = 1;
+                if (th < 1) th = 1;
+                tx = (dw - tw) / 2;
+                ty = (dh - th) / 2;
+                letterbox = 1;
+                logf_("preserve aspect: %ux%u backbuffer (%.3f) vs %dx%d "
+                      "screen (%.3f) -> image %dx%d at %d,%d (black bars "
+                      "left/right %d px, top/bottom %d px)",
+                      pp->BackBufferWidth, pp->BackBufferHeight, img,
+                      dw, dh, scr, tw, th, tx, ty, tx, ty);
+            }
+        }
+        set_borderless_window(hwnd, tx, ty, tw, th);
+        if (letterbox)
+            backdrop_show(hwnd, dw, dh);
     }
+    if (!letterbox)
+        backdrop_hide();
 
     logf_("present fixup (%s): %s -> windowed %ux%u%s",
           is_reset ? "reset" : "create",
           was_fullscreen ? "fullscreen" : "windowed",
           pp->BackBufferWidth, pp->BackBufferHeight,
-          g_borderless_active ? " (borderless, filling desktop)" : "");
+          g_borderless_active ? (letterbox ? " (borderless, letterboxed)"
+                                           : " (borderless, filling desktop)")
+                              : "");
 }
 
 /* Projection fixup. Hitman 2's fixed-function projection keeps the
@@ -1514,6 +1675,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
     (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
+        g_inst = inst;
         DisableThreadLibraryCalls(inst);
         GetModuleFileNameA(inst, g_dir, sizeof(g_dir));
         char *sl = strrchr(g_dir, '\\');
@@ -1534,12 +1696,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         if (g_enabled)
             CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
         logf_("H2SA Widescreen loaded%s, Fullscreen=%d Borderless=%d "
-              "FOVCorrect=%d FOVFactor=%.2f FpsCap=%d VSync=%d MouseClipFix=%d "
-              "MouseMotionFix=%d, Hitman2.ini resolution %dx%d",
+              "PreserveAspect=%d FOVCorrect=%d FOVFactor=%.2f FpsCap=%d "
+              "VSync=%d MouseClipFix=%d MouseMotionFix=%d, Hitman2.ini "
+              "resolution %dx%d",
               g_enabled ? "" : " (disabled)",
-              g_fullscreen, g_borderless, g_fovcorrect, (double)g_fovfactor,
-              g_fpscap, g_vsync, g_mouseclipfix, g_mousemotionfix,
-              g_ini_w, g_ini_h);
+              g_fullscreen, g_borderless, g_preserveaspect, g_fovcorrect,
+              (double)g_fovfactor, g_fpscap, g_vsync, g_mouseclipfix,
+              g_mousemotionfix, g_ini_w, g_ini_h);
 
         HMODULE loader = GetModuleHandleA("d3d8.dll");
         h2sa_register_fn reg = loader ? (h2sa_register_fn)(uintptr_t)

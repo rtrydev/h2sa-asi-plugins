@@ -140,8 +140,10 @@ untouched, so the HUD is not distorted.
 
 By default the game runs **borderless** — a frameless window filling the
 screen, centred and aspect-preserving (letterboxed where the game aspect does
-not match the display, so nothing is stretched). This is the robust default:
-it always creates, survives alt-tab, and needs no display mode-switch.
+not match the display, so nothing is stretched; a black full-screen backdrop
+window supplies the bars). Set `PreserveAspect=0` to stretch the image across
+the whole screen instead. This is the robust default: it always creates,
+survives alt-tab, and needs no display mode-switch.
 
 **Exclusive fullscreen** (`Fullscreen=1`) is **real-Windows only**:
 
@@ -236,6 +238,8 @@ Fullscreen=0      ; 1 = exclusive fullscreen (real Windows only, at an
                   ; enumerated mode); on Wine/Mac -> borderless-fullscreen
 Borderless=-1     ; when not fullscreen: -1 auto = borderless fills desktop
                   ; (all platforms), 0 plain window, 1 always borderless
+PreserveAspect=1  ; borderless: keep the Resolution's aspect ratio — largest
+                  ; centred fit, black bars fill the rest; 0 = stretch to fill
 FOVCorrect=1      ; Hor+ projection correction on/off
 FOVFactor=1.0     ; extra horizontal FOV multiplier (>1 = wider)
 CursorFix=0       ; hide stray macOS cursor + startup activation: 0 off
