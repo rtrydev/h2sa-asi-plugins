@@ -6,7 +6,7 @@ case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
         DEFAULT_GAME="/c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin";;
     *)
-        DEFAULT_GAME="/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin";;
+        DEFAULT_GAME="$HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin";;
 esac
 GAME="${H2SA_GAME_DIR:-$DEFAULT_GAME}"
 HERE="$(cd "$(dirname "$0")" && pwd)"

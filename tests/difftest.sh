@@ -19,7 +19,7 @@ WINE="${WINE:-/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/w
 export CX_BOTTLE="${CX_BOTTLE:-Steam}"
 export WINEDEBUG=-all
 
-GAME="${H2SA_GAME_DIR:-/Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin}"
+GAME="${H2SA_GAME_DIR:-$HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin}"
 GAME_WIN='C:\Program Files (x86)\Steam\steamapps\common\Hitman 2 Silent Assassin'
 
 [ -f "$ROOT/dist/RenderD3D.dll.x87" ] || { echo "run tools/translate.py first"; exit 1; }

@@ -57,7 +57,7 @@ only if both `dist/H2SAReducedX87.asi` and `dist/RenderD3D.dll.x87` exist.
 By default `install.sh` targets:
 
 ```text
-mac:     /Users/rtry/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin
+mac:     $HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin
 Windows: C:\Program Files (x86)\Steam\steamapps\common\Hitman 2 Silent Assassin
 ```
 
