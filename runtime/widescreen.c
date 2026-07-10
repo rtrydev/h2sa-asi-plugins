@@ -1331,6 +1331,23 @@ static void choose_fs_interval(D3DPRESENT_PARAMETERS *pp)
           g_fpscap * 2);
 }
 
+/* Frame-pacing mode. Decided ONCE by ~1.5s of calibration (see frame_limit),
+ * then committed — never mixed per frame. Re-decided after every
+ * CreateDevice/Reset, because a display-mode change can flip whether the
+ * driver honours the swap interval (i.e. whether Present itself paces). */
+enum { PACE_CAL, PACE_HW, PACE_SW };
+static int g_pace_mode = PACE_CAL;
+static int g_cal_frames, g_cal_slept;
+static LONGLONG g_pace_freq, g_pace_next;
+
+static void pace_recalibrate(const char *why)
+{
+    if (g_pace_mode == PACE_CAL && !g_cal_frames) return;  /* fresh already */
+    g_pace_mode = PACE_CAL;
+    g_cal_frames = g_cal_slept = 0;
+    logf_("frame pacing: recalibrating (%s)", why);
+}
+
 /* Presentation-parameters fixup: force windowed (the startup fix) and,
  * when borderless is wanted, expand to the desktop and strip the window. */
 static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
@@ -1347,6 +1364,7 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
     if (devwnd) g_game_hwnd = devwnd;
     assert_cursor_hidden(is_reset ? "device reset" : "device create");
     InterlockedExchange(&g_prime_needed, 1);   /* re-tell the Mac driver */
+    pace_recalibrate(is_reset ? "device reset" : "device create");
 
     /* Pin the backbuffer to the Hitman2.ini resolution. That is the value
      * the engine lays its viewport / HUD / mouse mapping out against, so the
@@ -1589,59 +1607,34 @@ static void wait_until(LONGLONG deadline, LONGLONG freq)
  * honoured), we almost never sleep -> switch to HW mode and stop sleeping
  * entirely. If not (e.g. a VRR/G-Sync panel strips the swap interval to
  * immediate, as on this rig), we keep pacing precisely in software. Either way
- * there is a single, consistent clock — no two-clock beat. */
-static void frame_limit(void)
+ * there is a single, consistent clock — no two-clock beat.
+ *
+ * WHERE the software wait happens matters too. Waiting after Present paces
+ * the START of the next frame, so each present time inherits that frame's
+ * work time (present N+1 = deadline N + work N+1) and frame-to-frame work
+ * VARIANCE passes straight into the scanout times. A fixed-Hz vsynced
+ * display absorbs that jitter in its vblank grid, but a VRR panel scans out
+ * AT the moment of Present — the variance shows as intermittent
+ * microstutter. So the committed software limiter waits just BEFORE Present
+ * (frame_pace_pre, the on_frame hook): presents land exactly on the QPC
+ * grid, the work variance is absorbed by the wait, and the panel sees the
+ * even cadence hardware vsync would have given. Calibration still paces
+ * after Present, because a blocking (hardware-paced) Present is exactly the
+ * signal it is measuring for. */
+static void frame_limit(void)      /* on_present: after Present returned */
 {
     if (g_fpscap <= 0) return;
 
-    static LARGE_INTEGER freq, next;
-    static int init;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
-    if (!init) {
-        QueryPerformanceFrequency(&freq);
+    if (!g_pace_freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_pace_freq = f.QuadPart;
+        g_pace_next = now.QuadPart;
         limiter_init();
-        next = now;
-        init = 1;
     }
-    if (freq.QuadPart <= 0) return;
-
-    LONGLONG period = freq.QuadPart / g_fpscap;
-
-    enum { CAL, HW, SW };
-    static int mode = CAL, cal_frames, cal_slept;
-
-    next.QuadPart += period;
-    if (next.QuadPart < now.QuadPart) {
-        /* Frame work overran the cap period — the deadline already passed.
-         * Present immediately and restart the schedule from now. Waiting
-         * until now+period here would tax every over-budget frame a full
-         * extra period (17ms of work -> 33.7ms frame), cliffing heavy
-         * scenes (gunfights, crowds) from 60 straight to ~30fps. */
-        next.QuadPart = now.QuadPart;
-    }
-
-    if (mode == HW) {                   /* display paces; never sleep */
-        next = now;
-        return;
-    }
-
-    /* CAL and SW both pace precisely. In CAL, note whether we had to sleep. */
-    wait_until(next.QuadPart, freq.QuadPart);
-
-    if (mode == CAL) {
-        LARGE_INTEGER after;
-        QueryPerformanceCounter(&after);
-        if (after.QuadPart - now.QuadPart > period / 8)   /* slept >~1/8 frame */
-            cal_slept++;
-        if (++cal_frames >= 90) {
-            mode = (cal_slept <= 5) ? HW : SW;
-            logf_("frame pacing: %s (slept %d/%d calibration frames, cap %d)",
-                  mode == HW ? "display/vsync — software limiter OFF"
-                             : "precise software limiter",
-                  cal_slept, cal_frames, g_fpscap);
-        }
-    }
+    if (g_pace_freq <= 0) return;
 
     /* Log the measured rate for the first few seconds so a run confirms the
      * cap engaged, then go quiet. */
@@ -1649,26 +1642,75 @@ static void frame_limit(void)
     static LARGE_INTEGER win_start;
     static long frames;
     if (samples < 5) {
-        QueryPerformanceCounter(&now);
         frames++;
         if (win_start.QuadPart == 0)
             win_start = now;
-        LONGLONG elapsed = now.QuadPart - win_start.QuadPart;
-        if (elapsed >= freq.QuadPart) {   /* ~1s window */
+        if (now.QuadPart - win_start.QuadPart >= g_pace_freq) { /* ~1s window */
             logf_("frame limiter: ~%ld fps (cap %d)", frames, g_fpscap);
             samples++;
             frames = 0;
             win_start = now;
         }
     }
+
+    if (g_pace_mode == PACE_SW)         /* paced in frame_pace_pre */
+        return;
+    if (g_pace_mode == PACE_HW) {       /* display paces; never sleep */
+        g_pace_next = now.QuadPart;
+        return;
+    }
+
+    /* PACE_CAL: pace post-present while noting whether we had to sleep. */
+    LONGLONG period = g_pace_freq / g_fpscap;
+    g_pace_next += period;
+    if (g_pace_next < now.QuadPart)     /* over budget: don't tax the frame */
+        g_pace_next = now.QuadPart;
+    wait_until(g_pace_next, g_pace_freq);
+
+    LARGE_INTEGER after;
+    QueryPerformanceCounter(&after);
+    if (after.QuadPart - now.QuadPart > period / 8)   /* slept >~1/8 frame */
+        g_cal_slept++;
+    if (++g_cal_frames >= 90) {
+        g_pace_mode = (g_cal_slept <= 5) ? PACE_HW : PACE_SW;
+        logf_("frame pacing: %s (slept %d/%d calibration frames, cap %d)",
+              g_pace_mode == PACE_HW
+                  ? "display/vsync — software limiter OFF"
+                  : "precise software limiter, presents aligned to the grid",
+              g_cal_slept, g_cal_frames, g_fpscap);
+    }
+}
+
+/* on_frame: runs just before Present forwards to the real implementation.
+ * In committed-software mode the pacing wait happens HERE, so the present
+ * itself lands on the grid (see the frame_limit comment above). */
+static void frame_pace_pre(IDirect3DDevice8 *dev)
+{
+    (void)dev;
+    if (g_fpscap <= 0 || g_pace_mode != PACE_SW || g_pace_freq <= 0)
+        return;
+
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    g_pace_next += g_pace_freq / g_fpscap;
+    if (g_pace_next < now.QuadPart) {
+        /* Frame work overran the cap period — the deadline already passed.
+         * Present immediately and restart the schedule from now. Waiting
+         * until now+period here would tax every over-budget frame a full
+         * extra period (17ms of work -> 33.7ms frame), cliffing heavy
+         * scenes (gunfights, crowds) from 60 straight to ~30fps. */
+        g_pace_next = now.QuadPart;
+    }
+    wait_until(g_pace_next, g_pace_freq);
 }
 
 static const H2SAD3D8Hooks g_hooks = {
     H2SA_D3D8_HOOKS_VERSION,
     fix_present,
     fix_projection,
-    NULL,
-    frame_limit,
+    NULL,           /* on_device */
+    frame_limit,    /* on_present: calibration / HW bookkeeping */
+    frame_pace_pre, /* on_frame: committed SW limiter waits before Present */
 };
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
