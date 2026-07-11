@@ -1,4 +1,8 @@
-/* H2SAProfiler.asi — on-screen performance overlay (top-right corner).
+/* h2sa_core.asi (profiler half) — on-screen performance overlay (top-right
+ * corner). Linked together with widescreen.c into h2sa_core.asi; widescreen.c
+ * owns the DllMain and calls h2sa_profiler_init/h2sa_profiler_detach, and the
+ * log (scripts/h2sa_core.log) and config (scripts/h2sa_core.ini, [Profiler]
+ * section) are shared.
  *
  * Shows, once per frame:
  *   - FPS and frame time (rolling average / peak over a ~0.5s window);
@@ -17,7 +21,7 @@
  * triangles via DrawPrimitiveUP, wrapped in a full state-block save/restore
  * so the game's own rendering is untouched. It attaches through the H2SA
  * d3d8 loader's on_frame hook (drawn just before Present), so it needs no
- * game byte offsets and coexists with the widescreen plugin.
+ * game byte offsets and coexists with the widescreen code.
  */
 #include <windows.h>
 #include <tlhelp32.h>
@@ -27,42 +31,41 @@
 #include <stdarg.h>
 #include <string.h>
 #include "h2sa_d3d8.h"
+#include "h2sa_core.h"
+
+/* shared log + paths live in widescreen.c (see h2sa_core.h) */
+#define logf_ h2sa_core_logf
 
 /* ------------------------------------------------------------------ */
-/* logging                                                            */
-/* ------------------------------------------------------------------ */
-static FILE *g_log;
-static char g_dir[MAX_PATH];
-
-static void logf_(const char *fmt, ...)
-{
-    if (!g_log) return;
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
-    va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
-}
-
-/* ------------------------------------------------------------------ */
-/* config                                                             */
+/* config ([Profiler] section of the shared h2sa_core.ini)            */
 /* ------------------------------------------------------------------ */
 static int   g_enabled = 1;
 static float g_scale = 1.0f;
 static int   g_show_cpu = 1;
 static int   g_off_x = 8;      /* inset from the right edge  */
 static int   g_off_y = 8;      /* inset from the top edge    */
-static char  g_ini[MAX_PATH];
 static FILETIME g_ini_mtime;
 
 static void load_config(void)
 {
-    FILE *f = fopen(g_ini, "r");
+    FILE *f = fopen(h2sa_core_ini, "r");
     if (!f) {
-        f = fopen(g_ini, "w");
+        f = fopen(h2sa_core_ini, "w");
         if (f) {
-            fputs("[Profiler]\n"
+            fputs("[Widescreen]\n"
+                  "Enabled=1\n"
+                  "Fullscreen=0\n"
+                  "Borderless=-1\n"
+                  "PreserveAspect=1\n"
+                  "FOVCorrect=1\n"
+                  "FOVFactor=1.0\n"
+                  "CursorFix=0\n"
+                  "FpsCap=60\n"
+                  "VSync=-1\n"
+                  "MouseClipFix=-1\n"
+                  "MouseMotionFix=-1\n"
+                  "\n"
+                  "[Profiler]\n"
                   "Enabled=1\n"
                   "Scale=1.0\n"
                   "ShowCPU=1\n"
@@ -73,8 +76,16 @@ static void load_config(void)
         return;
     }
     char line[128];
+    char section[32] = "";
     while (fgets(line, sizeof(line), f)) {
         int b; float v;
+        char s[32];
+        if (sscanf(line, " [%31[^]]]", s) == 1) {
+            lstrcpynA(section, s, sizeof(section));
+            continue;
+        }
+        if (_stricmp(section, "Profiler") != 0)
+            continue;      /* only consume our own section's keys */
         if (sscanf(line, " Enabled = %d", &b) == 1 ||
             sscanf(line, " Enabled=%d", &b) == 1) g_enabled = b;
         else if (sscanf(line, " ShowCPU = %d", &b) == 1 ||
@@ -93,7 +104,8 @@ static void load_config(void)
 static void reload_config_if_changed(void)
 {
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExA(g_ini, GetFileExInfoStandard, &fad)) return;
+    if (!GetFileAttributesExA(h2sa_core_ini, GetFileExInfoStandard, &fad))
+        return;
     if (memcmp(&fad.ftLastWriteTime, &g_ini_mtime, sizeof(FILETIME)) == 0)
         return;
     g_ini_mtime = fad.ftLastWriteTime;
@@ -130,7 +142,7 @@ static int  g_n_blobs;
 static void load_blob_desc(void)
 {
     char pat[MAX_PATH];
-    snprintf(pat, sizeof(pat), "%s\\H2SAReducedX87\\*.x87", g_dir);
+    snprintf(pat, sizeof(pat), "%s\\h2sa_reduced_x87\\*.x87", h2sa_core_dir);
     WIN32_FIND_DATAA fd;
     HANDLE fh = FindFirstFileA(pat, &fd);
     if (fh == INVALID_HANDLE_VALUE) {
@@ -140,7 +152,7 @@ static void load_blob_desc(void)
     do {
         if (g_n_blobs >= MAX_BLOBS) break;
         char path[MAX_PATH];
-        snprintf(path, sizeof(path), "%s\\H2SAReducedX87\\%s", g_dir,
+        snprintf(path, sizeof(path), "%s\\h2sa_reduced_x87\\%s", h2sa_core_dir,
                  fd.cFileName);
         FILE *f = fopen(path, "rb");
         if (!f) continue;
@@ -666,19 +678,13 @@ static const H2SAD3D8Hooks g_hooks = {
 };
 
 /* ------------------------------------------------------------------ */
-/* init                                                                */
+/* init — called from widescreen.c's DllMain (h2sa_core_dir/ini and the
+ * log are already set up there)                                       */
 /* ------------------------------------------------------------------ */
-static void init(HMODULE self)
+void h2sa_profiler_init(HMODULE self)
 {
-    GetModuleFileNameA(self, g_dir, sizeof(g_dir));
-    char *sl = strrchr(g_dir, '\\');
-    if (sl) *sl = 0;
-    snprintf(g_ini, sizeof(g_ini), "%s\\H2SAProfiler.ini", g_dir);
-
-    char logp[MAX_PATH];
-    snprintf(logp, sizeof(logp), "%s\\H2SAProfiler.log", g_dir);
-    g_log = fopen(logp, "w");
-    logf_("H2SA Profiler loaded");
+    (void)self;
+    logf_("h2sa_core profiler loaded");
 
     load_config();
     load_blob_desc();
@@ -690,18 +696,11 @@ static void init(HMODULE self)
     HMODULE loader = GetModuleHandleA("d3d8.dll");
     h2sa_register_fn reg = loader ? (h2sa_register_fn)(uintptr_t)
         GetProcAddress(loader, "H2SA_RegisterD3D8Hooks") : NULL;
-    if (reg) { reg(&g_hooks); logf_("registered D3D8 on_frame hook"); }
+    if (reg) { reg(&g_hooks); logf_("registered D3D8 on_frame hook (profiler)"); }
     else logf_("d3d8.dll loader / H2SA_RegisterD3D8Hooks not found");
 }
 
-BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
+void h2sa_profiler_detach(void)
 {
-    (void)reserved;
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(inst);
-        init((HMODULE)inst);
-    } else if (reason == DLL_PROCESS_DETACH) {
-        g_run = 0;
-    }
-    return TRUE;
+    g_run = 0;
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Turn a raw in-memory dump of hitman2.exe (from H2SADump.asi) into a
+"""Turn a raw in-memory dump of hitman2.exe (from h2sa_dump.asi) into a
 PE that pefile/analysis can read.
 
 The dump is the mapped image verbatim (byte i == *(base+i)), so RVAs already

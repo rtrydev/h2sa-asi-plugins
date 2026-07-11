@@ -16,11 +16,11 @@ i686-w64-mingw32-gcc -O2 -o "$HERE/harness.exe" "$HERE/harness.c" \
 STAGE=/tmp/h2test
 rm -rf "$STAGE"; mkdir -p "$STAGE/scripts"
 cp "$ROOT/dist/d3d8.dll" "$STAGE/"
-cp "$ROOT/dist/H2SAWidescreen.asi" "$STAGE/scripts/"
+cp "$ROOT/dist/h2sa_core.asi" "$STAGE/scripts/"
 printf '[Widescreen]\nEnabled=1\nBorderless=1\nFOVCorrect=1\nFOVFactor=1.0\n' \
-    > "$STAGE/scripts/H2SAWidescreen.ini"
+    > "$STAGE/scripts/h2sa_core.ini"
 cp "$HERE/harness.exe" "$STAGE/"
 
 "$WINE" "$STAGE/harness.exe" "Z:\\tmp\\h2test\\d3d8.dll"
 echo "--- loader log ---"
-cat "$STAGE/scripts/H2SAAsiLoader.log"
+cat "$STAGE/scripts/h2sa_asi_loader.log"

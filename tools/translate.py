@@ -27,7 +27,7 @@ from analyze import find_ftol, find_ci, GAME
 import capstone
 
 # Functions other mods patch mid-body: hooking them would make those byte
-# patches dead code. Known: H2SAWidescreen's resolution-snap `je` patch
+# patches dead code. Known: h2sa_core's (widescreen) resolution-snap `je` patch
 # (SNAP_SIG at +0x197f7, in func 0x197b0). That function is `nofp` so the
 # translator never selects it anyway, but exclude it explicitly for safety
 # in case a future build makes it translatable.

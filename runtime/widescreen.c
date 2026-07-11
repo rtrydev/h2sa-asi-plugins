@@ -1,5 +1,8 @@
-/* H2SA Widescreen — native widescreen + a working startup path for
- * Hitman 2: Silent Assassin under Wine/CrossOver (32-bit ASI).
+/* h2sa_core.asi (widescreen half) — native widescreen + a working startup
+ * path for Hitman 2: Silent Assassin under Wine/CrossOver (32-bit ASI).
+ * Linked together with profiler.c into h2sa_core.asi; this file owns the
+ * DllMain, the shared log (scripts/h2sa_core.log) and the shared config
+ * (scripts/h2sa_core.ini, [Widescreen] section).
  *
  * The game is a Direct3D 8 title. Two things break it or spoil it on a
  * modern Mac:
@@ -37,7 +40,7 @@
  * right "fullscreen" on this stack; there is nothing to gain from the
  * exclusive path here (the present cost is the same under D3DMetal).
  *
- * Config: scripts/H2SAWidescreen.ini
+ * Config: scripts/h2sa_core.ini
  *   [Widescreen]
  *   Enabled=1
  *   Fullscreen=0    ; 1 = exclusive fullscreen (real Windows only, at an
@@ -74,13 +77,16 @@
 #include <mmsystem.h>
 #include <immintrin.h>          /* _mm_pause for the limiter spin */
 #include "h2sa_d3d8.h"
+#include "h2sa_core.h"
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002  /* Win10 1803+ */
 #endif
 
+/* shared with profiler.c (see h2sa_core.h) */
 static FILE *g_log;
-static char g_dir[MAX_PATH];
+char h2sa_core_dir[MAX_PATH];
+char h2sa_core_ini[MAX_PATH];
 static int g_enabled = 1;
 static int g_borderless = -1;      /* -1 auto (Wine), 0 never, 1 always */
 static int g_fullscreen = 0;       /* 1 = exclusive fullscreen (see below) */
@@ -116,7 +122,7 @@ static volatile DWORD g_fg_deadline; /* startup-activation window still open */
 static volatile DWORD g_next_kick;   /* earliest tick for the next kick */
 static volatile int g_kicks_left;    /* remaining startup activation kicks */
 
-static void logf_(const char *fmt, ...)
+void h2sa_core_logf(const char *fmt, ...)
 {
     if (!g_log) return;
     va_list ap;
@@ -126,17 +132,26 @@ static void logf_(const char *fmt, ...)
     fputc('\n', g_log);
     fflush(g_log);
 }
+#define logf_ h2sa_core_logf
 
 static void read_config(void)
 {
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\H2SAWidescreen.ini", g_dir);
-    FILE *f = fopen(path, "r");
+    FILE *f = fopen(h2sa_core_ini, "r");
     if (!f) return;
     char line[128];
+    char section[32] = "";
     int b;
     float v;
     while (fgets(line, sizeof(line), f)) {
+        char s[32];
+        if (sscanf(line, " [%31[^]]]", s) == 1) {
+            lstrcpynA(section, s, sizeof(section));
+            continue;
+        }
+        /* only consume [Widescreen] keys (section-less lines count as ours
+         * for compatibility with a hand-trimmed ini) */
+        if (section[0] && _stricmp(section, "Widescreen") != 0)
+            continue;
         if (sscanf(line, " Enabled = %d", &b) == 1 ||
             sscanf(line, " Enabled=%d", &b) == 1)
             g_enabled = b;
@@ -186,7 +201,7 @@ static void read_config(void)
 static void read_game_resolution(void)
 {
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%s\\..\\Hitman2.ini", g_dir);
+    snprintf(path, sizeof(path), "%s\\..\\Hitman2.ini", h2sa_core_dir);
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[256];
@@ -1719,11 +1734,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
     if (reason == DLL_PROCESS_ATTACH) {
         g_inst = inst;
         DisableThreadLibraryCalls(inst);
-        GetModuleFileNameA(inst, g_dir, sizeof(g_dir));
-        char *sl = strrchr(g_dir, '\\');
+        GetModuleFileNameA(inst, h2sa_core_dir, sizeof(h2sa_core_dir));
+        char *sl = strrchr(h2sa_core_dir, '\\');
         if (sl) *sl = 0;
+        snprintf(h2sa_core_ini, sizeof(h2sa_core_ini), "%s\\h2sa_core.ini",
+                 h2sa_core_dir);
         char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\H2SAWidescreen.log", g_dir);
+        snprintf(logpath, sizeof(logpath), "%s\\h2sa_core.log", h2sa_core_dir);
         g_log = fopen(logpath, "w");
         read_config();
         read_game_resolution();
@@ -1737,7 +1754,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             g_snap_done = 1;
         if (g_enabled)
             CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
-        logf_("H2SA Widescreen loaded%s, Fullscreen=%d Borderless=%d "
+        logf_("h2sa_core widescreen loaded%s, Fullscreen=%d Borderless=%d "
               "PreserveAspect=%d FOVCorrect=%d FOVFactor=%.2f FpsCap=%d "
               "VSync=%d MouseClipFix=%d MouseMotionFix=%d, Hitman2.ini "
               "resolution %dx%d",
@@ -1756,6 +1773,12 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             logf_("d3d8.dll loader / H2SA_RegisterD3D8Hooks not found — "
                   "is the bundled d3d8.dll installed and overridden?");
         }
+
+        /* the profiler half of h2sa_core (profiler.c) — shares this log and
+         * ini, registers its own on_frame hook with the loader */
+        h2sa_profiler_init((HMODULE)inst);
+    } else if (reason == DLL_PROCESS_DETACH) {
+        h2sa_profiler_detach();
     }
     return TRUE;
 }

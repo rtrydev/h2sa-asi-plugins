@@ -11,39 +11,36 @@ LDFLAGS := -shared -Wl,--kill-at -static -lkernel32
 
 .PHONY: all clean
 
-all: ../dist/d3d8.dll ../dist/H2SAWidescreen.asi \
-     ../dist/H2SAReducedX87.asi ../dist/H2SAReducedX87-diag.asi \
-     ../dist/H2SAProfiler.asi
+all: ../dist/d3d8.dll ../dist/h2sa_core.asi \
+     ../dist/h2sa_reduced_x87.asi ../dist/h2sa_reduced_x87_diag.asi
 
 ../dist/d3d8.dll: asiloader.c d3d8.def h2sa_d3d8.h
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ asiloader.c d3d8.def $(LDFLAGS) \
 	      -Wl,--enable-stdcall-fixup -luser32 -lgdi32
 
-../dist/H2SAWidescreen.asi: widescreen.c h2sa_d3d8.h
+# core plugin: widescreen/startup/mouse fixes + the profiler overlay
+../dist/h2sa_core.asi: widescreen.c profiler.c h2sa_d3d8.h h2sa_core.h
 	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ widescreen.c $(LDFLAGS) -luser32 -lgdi32 -lwinmm
+	$(CC) $(CFLAGS) -o $@ widescreen.c profiler.c $(LDFLAGS) \
+	      -luser32 -lgdi32 -lwinmm
 
-../dist/H2SAReducedX87.asi: h2sax87.c helpers.S
+../dist/h2sa_reduced_x87.asi: h2sax87.c helpers.S
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-../dist/H2SAReducedX87-diag.asi: h2sax87.c helpers.S
+../dist/h2sa_reduced_x87_diag.asi: h2sax87.c helpers.S
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -DH2SA_DIAG -o $@ $^ $(LDFLAGS)
 
-../dist/H2SAProfiler.asi: profiler.c h2sa_d3d8.h
-	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ profiler.c $(LDFLAGS) -ld3d8
-
 # memory dumper for the packed hitman2.exe (not part of `all`)
-dump: ../dist/H2SADump.asi
+dump: ../dist/h2sa_dump.asi
 
-../dist/H2SADump.asi: dumper.c
+../dist/h2sa_dump.asi: dumper.c
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -f ../dist/d3d8.dll ../dist/H2SAWidescreen.asi \
-	      ../dist/H2SAReducedX87.asi ../dist/H2SAReducedX87-diag.asi \
-	      ../dist/H2SAProfiler.asi ../dist/H2SADump.asi
+	rm -f ../dist/d3d8.dll ../dist/h2sa_core.asi \
+	      ../dist/h2sa_reduced_x87.asi ../dist/h2sa_reduced_x87_diag.asi \
+	      ../dist/h2sa_dump.asi

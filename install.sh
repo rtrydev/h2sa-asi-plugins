@@ -11,70 +11,94 @@ esac
 GAME="${H2SA_GAME_DIR:-$DEFAULT_GAME}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-if [ "$1" = "-u" ]; then
-    rm -f "$GAME/d3d8.dll"
+# Files from before the snake_case rename / core merge (widescreen + profiler
+# are now one h2sa_core.asi). Removed on install and uninstall; the old inis
+# are only removed after their settings were migrated into h2sa_core.ini.
+remove_legacy() {
     rm -f "$GAME/scripts/H2SAAsiLoader.log"
     rm -f "$GAME/scripts/H2SAWidescreen.asi"
+    rm -f "$GAME/scripts/H2SAWidescreen.ini"
     rm -f "$GAME/scripts/H2SAWidescreen.log"
+    rm -f "$GAME/scripts/H2SAProfiler.asi"
+    rm -f "$GAME/scripts/H2SAProfiler.ini"
+    rm -f "$GAME/scripts/H2SAProfiler.log"
     rm -f "$GAME/scripts/H2SAReducedX87.asi"
     rm -f "$GAME/scripts/H2SAReducedX87-diag.asi"
     rm -f "$GAME/scripts/H2SAReducedX87.log"
     rm -rf "$GAME/scripts/H2SAReducedX87"
-    rm -f "$GAME/scripts/H2SAProfiler.asi"
-    rm -f "$GAME/scripts/H2SAProfiler.log"
+    rm -f "$GAME/scripts/H2SADump.asi"
+    rm -f "$GAME/scripts/H2SADump.log"
+}
+
+if [ "$1" = "-u" ]; then
+    rm -f "$GAME/d3d8.dll"
+    rm -f "$GAME/scripts/h2sa_asi_loader.log"
+    rm -f "$GAME/scripts/h2sa_core.asi"
+    rm -f "$GAME/scripts/h2sa_core.log"
+    rm -f "$GAME/scripts/h2sa_reduced_x87.asi"
+    rm -f "$GAME/scripts/h2sa_reduced_x87_diag.asi"
+    rm -f "$GAME/scripts/h2sa_reduced_x87.log"
+    rm -rf "$GAME/scripts/h2sa_reduced_x87"
+    rm -f "$GAME/scripts/h2sa_dump.asi"
+    rm -f "$GAME/scripts/h2sa_dump.log"
+    remove_legacy
     # the plugin .ini is user config; left in place on purpose.
     # Hitman2.ini is not touched on uninstall; restore Hitman2.ini.bak by hand
     # if you want the original resolution back.
-    echo "uninstalled (d3d8.dll + plugin removed; Hitman2.ini left as-is)"
+    echo "uninstalled (d3d8.dll + plugins removed; h2sa_core.ini and Hitman2.ini left as-is)"
     exit 0
 fi
 
 [ -f "$HERE/dist/d3d8.dll" ] || { echo "build first: (cd runtime && make)"; exit 1; }
-[ -f "$HERE/dist/H2SAWidescreen.asi" ] || { echo "build first: (cd runtime && make)"; exit 1; }
+[ -f "$HERE/dist/h2sa_core.asi" ] || { echo "build first: (cd runtime && make)"; exit 1; }
 [ -d "$GAME" ] || { echo "game dir not found: $GAME (set H2SA_GAME_DIR)"; exit 1; }
 
 mkdir -p "$GAME/scripts"
 
+# Migrate a pre-rename install: the old per-plugin configs become the
+# [Widescreen] / [Profiler] sections of the merged h2sa_core.ini.
+OLD_WS_INI="$GAME/scripts/H2SAWidescreen.ini"
+OLD_PF_INI="$GAME/scripts/H2SAProfiler.ini"
+if [ ! -f "$GAME/scripts/h2sa_core.ini" ] &&
+   { [ -f "$OLD_WS_INI" ] || [ -f "$OLD_PF_INI" ]; }; then
+    {
+        [ -f "$OLD_WS_INI" ] && { cat "$OLD_WS_INI"; echo; }
+        [ -f "$OLD_PF_INI" ] && cat "$OLD_PF_INI"
+    } > "$GAME/scripts/h2sa_core.ini"
+    echo "migrated old H2SAWidescreen.ini/H2SAProfiler.ini settings -> scripts/h2sa_core.ini"
+fi
+remove_legacy
+
 # ASI loader: d3d8.dll proxy in the game root (also carries the D3D8 hooks)
 cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 
-# Widescreen + startup fix plugin
-cp "$HERE/dist/H2SAWidescreen.asi" "$GAME/scripts/"
-if [ ! -f "$GAME/scripts/H2SAWidescreen.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nPreserveAspect=1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nMouseClipFix=-1\nMouseMotionFix=-1\n' \
-        > "$GAME/scripts/H2SAWidescreen.ini"
+# Core plugin: widescreen + startup fix + mouse fixes + frame cap, plus the
+# performance profiler overlay (top-right; [Profiler] section of the ini).
+cp "$HERE/dist/h2sa_core.asi" "$GAME/scripts/"
+if [ ! -f "$GAME/scripts/h2sa_core.ini" ]; then
+    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nPreserveAspect=1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nMouseClipFix=-1\nMouseMotionFix=-1\n\n[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=1\nOffsetX=8\nOffsetY=8\n' \
+        > "$GAME/scripts/h2sa_core.ini"
 fi
 
 # Reduced-precision x87 plugin: SSE2-translated RenderD3D.dll for CrossOver
-# performance. The .asi loads any <module>.x87 blob from scripts/H2SAReducedX87/.
-if [ -f "$HERE/dist/H2SAReducedX87.asi" ] && [ -f "$HERE/dist/RenderD3D.dll.x87" ]; then
-    cp "$HERE/dist/H2SAReducedX87.asi" "$GAME/scripts/"
-    # a stray diag build would win the *.asi load race (- sorts before .) and
-    # hook the game with helper-call counting overhead; never leave one behind
-    rm -f "$GAME/scripts/H2SAReducedX87-diag.asi"
-    mkdir -p "$GAME/scripts/H2SAReducedX87"
-    cp "$HERE/dist/RenderD3D.dll.x87" "$GAME/scripts/H2SAReducedX87/"
+# performance. The .asi loads any <module>.x87 blob from scripts/h2sa_reduced_x87/.
+if [ -f "$HERE/dist/h2sa_reduced_x87.asi" ] && [ -f "$HERE/dist/RenderD3D.dll.x87" ]; then
+    cp "$HERE/dist/h2sa_reduced_x87.asi" "$GAME/scripts/"
+    # a stray diag build would also hook the game with helper-call counting
+    # overhead; never leave one behind
+    rm -f "$GAME/scripts/h2sa_reduced_x87_diag.asi"
+    mkdir -p "$GAME/scripts/h2sa_reduced_x87"
+    cp "$HERE/dist/RenderD3D.dll.x87" "$GAME/scripts/h2sa_reduced_x87/"
     msg="RenderD3D.dll.x87"
     # hitman2.exe.x87 (game-logic x87) is optional: generated by dumping the
-    # packed exe once (see tools/undump.py / H2SADump.asi). Install if present.
+    # packed exe once (see tools/undump.py / h2sa_dump.asi). Install if present.
     if [ -f "$HERE/dist/hitman2.exe.x87" ]; then
-        cp "$HERE/dist/hitman2.exe.x87" "$GAME/scripts/H2SAReducedX87/"
+        cp "$HERE/dist/hitman2.exe.x87" "$GAME/scripts/h2sa_reduced_x87/"
         msg="$msg + hitman2.exe.x87"
     fi
-    echo "x87 plugin: H2SAReducedX87.asi + $msg installed"
+    echo "x87 plugin: h2sa_reduced_x87.asi + $msg installed"
 else
     echo "NOTE: x87 plugin not installed (build runtime + run tools/translate.py)"
-fi
-
-# Performance profiler overlay (top-right): FPS/frame time + EIP-sampled
-# CPU share (translated x87 blob vs remaining RenderD3D vs game vs rest).
-if [ -f "$HERE/dist/H2SAProfiler.asi" ]; then
-    cp "$HERE/dist/H2SAProfiler.asi" "$GAME/scripts/"
-    if [ ! -f "$GAME/scripts/H2SAProfiler.ini" ]; then
-        printf '[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=1\nOffsetX=8\nOffsetY=8\n' \
-            > "$GAME/scripts/H2SAProfiler.ini"
-    fi
-    echo "profiler: H2SAProfiler.asi installed (top-right overlay)"
 fi
 
 # Give widescreen out of the box: if Hitman2.ini still has the placeholder
@@ -129,9 +153,8 @@ fi
 
 echo "installed to $GAME"
 echo "  loader:     $GAME/d3d8.dll"
-echo "  plugin:     $GAME/scripts/H2SAWidescreen.asi"
-echo "  config:     $GAME/scripts/H2SAWidescreen.ini"
-echo "  x87 plugin: $GAME/scripts/H2SAReducedX87.asi (+ H2SAReducedX87/RenderD3D.dll.x87)"
-echo "  profiler:   $GAME/scripts/H2SAProfiler.asi (top-right overlay)"
-echo "logs after launch: H2SAAsiLoader.log, H2SAWidescreen.log, H2SAReducedX87.log, H2SAProfiler.log"
+echo "  core:       $GAME/scripts/h2sa_core.asi (widescreen/startup/mouse/fps + profiler overlay)"
+echo "  config:     $GAME/scripts/h2sa_core.ini"
+echo "  x87 plugin: $GAME/scripts/h2sa_reduced_x87.asi (+ h2sa_reduced_x87/RenderD3D.dll.x87)"
+echo "logs after launch: h2sa_asi_loader.log, h2sa_core.log, h2sa_reduced_x87.log"
 echo "Launch through Steam so the game's Steam check passes."

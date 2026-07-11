@@ -13,7 +13,7 @@
  * On process attach (which for this proxy means "when the renderer loads")
  * it:
  *  - loads every *.asi from the scripts/ directory next to it, logging to
- *    scripts/H2SAAsiLoader.log;
+ *    scripts/h2sa_asi_loader.log;
  *  - exports all five real d3d8.dll entry points at their real ordinals
  *    (see d3d8.def) and forwards four of them to the system d3d8.dll,
  *    resolved lazily on first call;
@@ -379,7 +379,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         char *sl = strrchr(g_dir, '\\');
         if (sl) *sl = 0;
         char logpath[MAX_PATH];
-        snprintf(logpath, sizeof(logpath), "%s\\scripts\\H2SAAsiLoader.log",
+        snprintf(logpath, sizeof(logpath), "%s\\scripts\\h2sa_asi_loader.log",
                  g_dir);
         g_log = fopen(logpath, "w");
         logf_("H2SA ASI Loader (d3d8.dll proxy) attached");

@@ -6,19 +6,19 @@ the sibling of the [Hitman: Codename 47 build](https://github.com/rtrydev/hc47-a
 games are close relatives but Hitman 2 is a **Direct3D 8** title, which
 changes how the loader attaches and how the widescreen/startup fix is done.
 
-The repo builds four artifacts:
+The repo builds three artifacts:
 
 - `d3d8.dll` — a Direct3D 8 proxy that doubles as the ASI loader. It loads
   every `*.asi` from `scripts/`, forwards the real d3d8 exports to the
   system d3d8, and wraps the D3D8 COM interface so plugins can influence
   device creation and rendering without patching game code.
-- `H2SAWidescreen.asi` — makes the game **start** under CrossOver (the
-  stock exclusive-fullscreen device fails there) and renders it in correct
-  widescreen at any resolution.
-- `H2SAReducedX87.asi` — translates the renderer's x87 float code to SSE2
+- `h2sa_core.asi` — makes the game **start** under CrossOver (the stock
+  exclusive-fullscreen device fails there), renders it in correct widescreen
+  at any resolution, fixes mouse-look under winemac, caps the frame rate,
+  and draws an optional top-right performance overlay (FPS, frame time and
+  an EIP-sampled CPU-time breakdown — see below).
+- `h2sa_reduced_x87.asi` — translates the renderer's x87 float code to SSE2
   at runtime for a large CrossOver/Rosetta 2 performance win (see below).
-- `H2SAProfiler.asi` — a top-right on-screen overlay showing FPS, frame
-  time, and an EIP-sampled CPU-time breakdown (see below).
 
 The widescreen/startup fix hooks the fixed Direct3D 8 COM ABI, so it has
 **no game-build byte offsets** to break — unlike the C47 build, which
@@ -50,9 +50,9 @@ python3 tools/translate.py    # writes dist/RenderD3D.dll.x87 (x87 plugin)
 ./install.sh -u               # uninstall (leaves your .ini and Hitman2.ini)
 ```
 
-The `translate.py` step is only for `H2SAReducedX87.asi`; the loader and
-widescreen plugin build without it. `install.sh` installs the x87 plugin
-only if both `dist/H2SAReducedX87.asi` and `dist/RenderD3D.dll.x87` exist.
+The `translate.py` step is only for `h2sa_reduced_x87.asi`; the loader and
+core plugin build without it. `install.sh` installs the x87 plugin
+only if both `dist/h2sa_reduced_x87.asi` and `dist/RenderD3D.dll.x87` exist.
 
 By default `install.sh` targets:
 
@@ -94,7 +94,12 @@ Hitman 2 checks for Steam at startup and exits immediately if it is not
 present, so launch it the normal way (through the Steam client, appid
 `6850`), not by running `hitman2.exe` directly.
 
-## Plugin: Widescreen + startup fix (`H2SAWidescreen.asi`)
+## Plugin: Core (`h2sa_core.asi`) — widescreen, startup, input, pacing
+
+The core plugin bundles everything that adapts the game to a modern system:
+the startup/widescreen fix, the winemac mouse fixes, the frame-rate cap and
+the profiler overlay (documented in its own section below). Each feature is
+configured from its section of `scripts/h2sa_core.ini`.
 
 Two problems on a modern Mac, both handled at the D3D8 boundary:
 
@@ -229,7 +234,7 @@ byte-offsets. (H2's `p5dll.dll` HID import drives the exotic **P5 data glove**,
 not the mouse — a red herring.) Set either to `0` to disable (both are off by
 default on real Windows, which needs neither).
 
-Config: `scripts/H2SAWidescreen.ini`
+Config: `scripts/h2sa_core.ini`, `[Widescreen]` section
 
 ```ini
 [Widescreen]
@@ -264,11 +269,11 @@ hold `FpsCap` (default **60**), which restores stock-like behaviour. Set
 Install output:
 
 - Loader: `d3d8.dll` (game root)
-- ASI: `scripts/H2SAWidescreen.asi`
-- Config: `scripts/H2SAWidescreen.ini`
-- Logs: `scripts/H2SAAsiLoader.log`, `scripts/H2SAWidescreen.log`
+- ASI: `scripts/h2sa_core.asi`
+- Config: `scripts/h2sa_core.ini` (`[Widescreen]` + `[Profiler]` sections)
+- Logs: `scripts/h2sa_asi_loader.log`, `scripts/h2sa_core.log`
 
-## Plugin: Reduced x87 (`H2SAReducedX87.asi`)
+## Plugin: Reduced x87 (`h2sa_reduced_x87.asi`)
 
 Improves performance under CrossOver/Rosetta 2, where x87 instructions are
 emulated in software (80-bit) while SSE2 runs on hardware. An offline
@@ -296,14 +301,14 @@ code cannot be read from the on-disk image; it has to be dumped from memory
 first:
 
 ```sh
-(cd runtime && make dump)                 # builds dist/H2SADump.asi
-cp dist/H2SADump.asi "$GAME/scripts/"     # launch once; writes hitman2_dump.bin
+(cd runtime && make dump)                 # builds dist/h2sa_dump.asi
+cp dist/h2sa_dump.asi "$GAME/scripts/"     # launch once; writes hitman2_dump.bin
 python3 tools/undump.py "$GAME/scripts/hitman2_dump.bin" -o staging/hitman2.exe
 python3 tools/translate.py hitman2.exe --game staging   # dist/hitman2.exe.x87
-# remove H2SADump.asi afterwards; install.sh picks up hitman2.exe.x87 if present
+# remove h2sa_dump.asi afterwards; install.sh picks up hitman2.exe.x87 if present
 ```
 
-`H2SADump.asi` waits until the game is fully up (unpacker long finished),
+`h2sa_dump.asi` waits until the game is fully up (unpacker long finished),
 then writes `hitman2.exe`'s mapped image; `tools/undump.py` rewrites the
 section headers into a memory-aligned PE the analyzer can read. Coverage on
 the unpacked image is ~1,040 functions / ~46,500 x87 instructions (about
@@ -326,21 +331,21 @@ Generate the patch blob and build the plugin:
 ```sh
 pip3 install capstone pefile
 python3 tools/translate.py            # writes dist/RenderD3D.dll.x87
-(cd runtime && make)                  # builds dist/H2SAReducedX87.asi
+(cd runtime && make)                  # builds dist/h2sa_reduced_x87.asi
 ./install.sh                          # installs the .asi + the .x87 blob
 ```
 
 The plugin is byte-checked: if `RenderD3D.dll`'s PE timestamp or image size
 does not match the blob, it logs a mismatch and applies nothing. It also
-coordinates with the widescreen plugin — the one function that mod patches
+coordinates with the core plugin — the one function that mod patches
 mid-body (the resolution-snap `je`) is on the translator's exclusion list,
 though it is a no-FP function the translator would never select anyway.
 
 Install output:
 
-- ASI: `scripts/H2SAReducedX87.asi`
-- Patch blob: `scripts/H2SAReducedX87/RenderD3D.dll.x87`
-- Log: `scripts/H2SAReducedX87.log`
+- ASI: `scripts/h2sa_reduced_x87.asi`
+- Patch blob: `scripts/h2sa_reduced_x87/RenderD3D.dll.x87`
+- Log: `scripts/h2sa_reduced_x87.log`
 
 Expected log after launch:
 
@@ -348,13 +353,13 @@ Expected log after launch:
 [renderd3d.dll] applied: 198/198 hooks, blob 199 KB at ... (delta ...)
 ```
 
-A diagnostic build (`H2SAReducedX87-diag.asi`, also built by `make`) adds a
+A diagnostic build (`h2sa_reduced_x87_diag.asi`, also built by `make`) adds a
 NaN/Inf tripwire at float-returning translated functions and logs the FPU
 control word and helper-call counts — useful if a translated function is
 suspected of misbehaving. If a specific function does, exclude it by RVA:
 `python3 tools/translate.py --exclude 0x1234`.
 
-## Plugin: Profiler (`H2SAProfiler.asi`)
+## Profiler overlay (`h2sa_core.asi`, `[Profiler]` section)
 
 A small performance overlay in the top-right corner, drawn each frame
 through the loader's `on_frame` hook (a built-in 5x7 pixel font rendered as
@@ -374,7 +379,7 @@ REST 17%            ; everything else (D3D/Metal, wine, system)
 
 The CPU split comes from a background EIP-sampling thread that reads each
 game thread's instruction pointer and buckets it by module. It follows the
-`H2SAReducedX87` entry hooks to find the translated blob, so blob samples
+`h2sa_reduced_x87` entry hooks to find the translated blob, so blob samples
 are attributed to **X87** and untranslated RenderD3D samples to **REND** —
 making the x87 translation's effect directly visible (time that was
 emulated x87 inside RenderD3D now shows up as native SSE2 under X87).
@@ -386,7 +391,7 @@ filter skips those blocked service threads (the same approach HC47's
 `eipprof` uses on this bottle). With `ShowCPU=0` the sampler still runs but
 only FPS/frame time is drawn.
 
-Config: `scripts/H2SAProfiler.ini`
+Config: `scripts/h2sa_core.ini`, `[Profiler]` section
 
 ```ini
 [Profiler]
@@ -401,20 +406,16 @@ The overlay is outlined text with no background panel, at the same glyph
 size as the stats-overlay `SA`/`AZ` labels (`Scale=1.0`); lower `Scale` for
 a smaller readout.
 
-Install output:
-
-- ASI: `scripts/H2SAProfiler.asi`
-- Config: `scripts/H2SAProfiler.ini`
-- Log: `scripts/H2SAProfiler.log` — a periodic text snapshot of the same
-  stats (useful when a screenshot is not available), plus a `REST-top:`
-  breakdown naming the modules the "REST" time actually lands in (e.g.
-  `wined3d.dll`, `d3d8.dll`, `ntdll.dll`), which tells CPU draw-submission
-  cost apart from GPU/idle waiting.
+The profiler shares `scripts/h2sa_core.log`, where it writes a periodic text
+snapshot of the same stats (useful when a screenshot is not available), plus
+a `REST-top:` breakdown naming the modules the "REST" time actually lands in
+(e.g. `wined3d.dll`, `d3d8.dll`, `ntdll.dll`), which tells CPU
+draw-submission cost apart from GPU/idle waiting.
 
 ## ASI Loader (`d3d8.dll`)
 
 A minimal d3d8.dll proxy (`runtime/asiloader.c`). On attach it loads every
-`*.asi` from `scripts/` and logs to `scripts/H2SAAsiLoader.log`. It exports
+`*.asi` from `scripts/` and logs to `scripts/h2sa_asi_loader.log`. It exports
 all five real d3d8 entry points at their real ordinals (see
 `runtime/d3d8.def`); four are forwarded to the system d3d8, resolved lazily,
 and `Direct3DCreate8` is wrapped so the returned `IDirect3D8` — and the
@@ -439,12 +440,12 @@ can be exercised without launching the game:
 
 ```sh
 i686-w64-mingw32-gcc -O2 -o tests/harness.exe tests/harness.c -ld3d8 -luser32 -lgdi32
-# stage dist/d3d8.dll + dist/H2SAWidescreen.asi next to it under scripts/, then
+# stage dist/d3d8.dll + dist/h2sa_core.asi next to it under scripts/, then
 # run harness.exe under the bottle's wine; expect "RESULT: OK" and a windowed device.
 ```
 
 For the real game, launch through Steam and inspect
-`scripts/H2SAAsiLoader.log` and `scripts/H2SAWidescreen.log`: they record the
+`scripts/h2sa_asi_loader.log` and `scripts/h2sa_core.log`: they record the
 requested vs. applied presentation parameters and the `CreateDevice` result.
 
 ### Differential tester (x87 translation)

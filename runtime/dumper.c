@@ -1,4 +1,4 @@
-/* H2SADump.asi — one-shot memory dumper for the packed hitman2.exe.
+/* h2sa_dump.asi — one-shot memory dumper for the packed hitman2.exe.
  *
  * hitman2.exe ships packed: a single writable, max-entropy .text unpacked by
  * a stub at startup, so its real code exists only in memory. To translate its
@@ -10,7 +10,7 @@
  * Output: scripts/hitman2_dump.bin  — the raw in-memory image, byte i =
  *         *(base+i). tools/undump.py rewrites the section headers
  *         (PointerToRawData=VirtualAddress) so pefile/analysis can read it.
- * Log:    scripts/H2SADump.log — base, SizeOfImage, entry, bytes written.
+ * Log:    scripts/h2sa_dump.log — base, SizeOfImage, entry, bytes written.
  *
  * Not part of the default build. Build with `make dump`, drop the ASI in
  * scripts/, launch once, then remove it.
@@ -109,9 +109,9 @@ static void init(HMODULE self)
     char *sl = strrchr(g_dir, '\\');
     if (sl) *sl = 0;
     char logp[MAX_PATH];
-    snprintf(logp, sizeof(logp), "%s\\H2SADump.log", g_dir);
+    snprintf(logp, sizeof(logp), "%s\\h2sa_dump.log", g_dir);
     g_log = fopen(logp, "w");
-    logf_("H2SADump loaded; waiting for game to unpack...");
+    logf_("h2sa_dump loaded; waiting for game to unpack...");
     CreateThread(NULL, 0, worker, NULL, 0, NULL);
 }
 
