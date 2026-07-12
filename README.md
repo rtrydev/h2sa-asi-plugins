@@ -247,13 +247,24 @@ none of the C47 HudScale/SharpText patch points exist here.
 The lever the engine *does* expose is the decoupling of what it **believes**
 from what the device **renders** (`UIScale`):
 
-- `Hitman2.ini Resolution` becomes the **UI layout resolution** — the game
-  believes it end-to-end (layout, anchors, mouse), so e.g. `1440x900` gives
-  the UI the size it had on a 900px-tall screen.
-- The plugin creates the **backbuffer larger**: with `UIScale=-1` (auto) at
-  the display's native (Retina) pixel size of the letterboxed image, so the
-  windowed present blits ~1:1 to physical pixels; with `UIScale=1.5` at an
-  explicit multiple of the ini resolution (cheaper than native).
+- `UIScale=-1` (auto): `Hitman2.ini Resolution` is the **UI layout
+  resolution** — the game believes it end-to-end (layout, anchors, mouse), so
+  e.g. `1440x900` gives the UI the size it had on a 900px-tall screen — and
+  the plugin creates the **backbuffer larger**, at the display's native
+  (Retina) pixel size of the letterboxed image, so the windowed present blits
+  ~1:1 to physical pixels.
+- `UIScale=N` (N>1): `Hitman2.ini Resolution` stays the **render
+  resolution** and the UI is laid out **N× bigger** (as at `Resolution/N`).
+  The engine parses `Hitman2.ini` before the renderer — and with it this
+  plugin — even loads, so the plugin patches the engine's already-parsed
+  resolution in memory at load time (one `(w,h)` pair, found by value scan;
+  verified: the engine then *requests* the divided resolution itself at
+  `CreateDevice`). Because the backbuffer stays at the ini resolution — an
+  enumerated display mode — **this mode also works in exclusive fullscreen**
+  on real Windows, e.g. `Resolution 3840x2160` + `UIScale=2` = native 4K
+  rendering with the UI sized as at 1080p. If the memory scan finds nothing,
+  it falls back to plain supersampling (backbuffer = N × ini, UI size
+  unchanged) and says so in the log.
 - The engine emits everything in normalized device coordinates derived from
   the believed size, so the whole UI lands at the right place and relative
   size on the bigger backbuffer automatically; only the **viewports** the
@@ -278,10 +289,13 @@ Overlays that draw in real backbuffer pixels (the profiler, and
 loader's exported `H2SA_GetUIScale()`, so they keep their configured on-screen
 size.
 
-Suggested setup on this stack: `Resolution 1440x900` (UI as at 900p, 16:10)
-with `UIScale=-1` — verified to render 3600x2250 on a 1800x1169-logical Retina
-desktop with the HUD correctly scaled and 60 fps held. Exclusive fullscreen
-skips UIScale (the backbuffer must be an enumerated mode there).
+Suggested setup on the Mac/CrossOver stack: `Resolution 1440x900` (UI as at
+900p, 16:10) with `UIScale=-1` — verified to render 3600x2250 on a
+1800x1169-logical Retina desktop with the HUD correctly scaled and 60 fps
+held. On real Windows: `Resolution` = your monitor's native mode and
+`UIScale=2` (or whatever UI magnification you want) — works windowed,
+borderless and in exclusive fullscreen. Only auto (`-1`) is skipped in
+exclusive fullscreen (it would need a non-enumerated backbuffer).
 
 Config: `scripts/h2sa_core.ini`, `[Widescreen]` section
 
@@ -303,9 +317,10 @@ MouseClipFix=-1   ; fix the mouse-look edge wall (inset the renderer's full-
                   ; window cursor clip): -1 auto (on under Wine), 0 off, 1 on
 MouseMotionFix=-1 ; fix the slow-move stall (feed the DirectInput camera from
                   ; GetCursorPos): -1 auto (on under Wine), 0 off, 1 on
-UIScale=-1        ; render bigger than the Hitman2.ini resolution (which
-                  ; becomes the UI layout size): -1 auto = native (Retina)
-                  ; pixels, >1 = explicit multiplier, 0/1 = off
+UIScale=-1        ; -1 auto = render at native (Retina) pixels, UI laid out
+                  ; at the Hitman2.ini resolution; N>1 = UI laid out N x
+                  ; bigger, Hitman2.ini stays the render resolution (also
+                  ; works in exclusive fullscreen); 0/1 = off
 ```
 
 ### Frame-rate cap

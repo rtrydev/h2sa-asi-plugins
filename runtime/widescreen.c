@@ -67,11 +67,13 @@
  *                   ; the cap (present every Nth vblank when refresh = N*cap),
  *                   ; else vsync every frame; 0 off (software cap only, may
  *                   ; tear); 1 force vsync-every-frame
- *   UIScale=-1      ; decouple the render resolution from the Hitman2.ini
- *                   ; Resolution (which becomes the UI LAYOUT size): -1 auto
- *                   ; = render at the display's native (Retina) pixels, >1 =
- *                   ; explicit backbuffer multiplier, 0/1 = off. See
- *                   ; uiscale.c for the design and the approaches rejected.
+ *   UIScale=-1      ; decouple the render resolution from the UI layout size:
+ *                   ; -1 auto = render at the display's native (Retina) pixels,
+ *                   ; UI laid out at the Hitman2.ini Resolution; N>1 = the UI
+ *                   ; is laid out N x bigger while the Hitman2.ini Resolution
+ *                   ; stays the render resolution (works in exclusive
+ *                   ; fullscreen too); 0/1 = off. See uiscale.c for the
+ *                   ; design and the approaches rejected.
  */
 #include <d3d8.h>
 #include <stdio.h>
@@ -123,8 +125,13 @@ static int g_mousemotionfix = -1;  /* feed the DirectInput camera motion from th
                                     * winemac's lossy relative axis, fixing the
                                     * slow-move stall: -1 auto (Wine), 0 off, 1 on */
 static float g_uiscale_cfg = 0.0f; /* [Widescreen] UIScale: 0/1 off, -1 auto
-                                    * (native-pixel backbuffer), >1 explicit
-                                    * multiplier over the Hitman2.ini res */
+                                    * (native-pixel backbuffer), N>1: UI laid
+                                    * out N x bigger; the Hitman2.ini res is
+                                    * the render res (see uiscale.c) */
+static int g_render_w, g_render_h; /* UIScale>1 re-believed: the Hitman2.ini
+                                    * (render) resolution; g_ini_w/h then hold
+                                    * the layout resolution the engine was
+                                    * patched to believe. 0 = not re-believed */
 static int g_mode_w, g_mode_h;     /* adapter display mode (physical pixels;
                                     * on Retina = 2x the logical desktop) */
 static HWND g_game_hwnd;           /* the game window, learned at device init */
@@ -238,6 +245,48 @@ static void read_game_resolution(void)
         break;
     }
     fclose(f);
+}
+
+/* UIScale re-believe drift guard, called at process detach: if the engine
+ * saved its (patched) layout resolution back into Hitman2.ini on exit, put
+ * the render resolution back — otherwise the next launch would divide the
+ * already-divided value again. Any other value (the user changed it) is
+ * left alone. */
+static void restore_ini_resolution(void)
+{
+    if (!g_render_w || !g_render_h) return;
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\..\\Hitman2.ini", h2sa_core_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char out[8192], line[512];
+    size_t o = 0;
+    int changed = 0;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        int w = 0, h = 0;
+        if (_strnicmp(p, "Resolution", 10) == 0 &&
+            sscanf(p + 10, " %dx%d", &w, &h) == 2 &&
+            w == g_ini_w && h == g_ini_h) {
+            snprintf(line, sizeof(line), "Resolution %dx%d\n",
+                     g_render_w, g_render_h);
+            changed = 1;
+        }
+        size_t l = strlen(line);
+        if (o + l >= sizeof(out)) { changed = 0; break; }  /* too big: skip */
+        memcpy(out + o, line, l);
+        o += l;
+    }
+    fclose(f);
+    if (!changed) return;
+    f = fopen(path, "w");
+    if (!f) return;
+    fwrite(out, 1, o, f);
+    fclose(f);
+    logf_("Hitman2.ini: engine saved the layout resolution %dx%d — restored "
+          "the render resolution %dx%d", g_ini_w, g_ini_h,
+          g_render_w, g_render_h);
 }
 
 static int is_wine(void)
@@ -1442,7 +1491,12 @@ static void uiscale_pick_backbuffer(D3DPRESENT_PARAMETERS *pp, int dw, int dh)
         return;
     }
     double bw, bh;
-    if (cfg > 1.0f) {
+    if (cfg > 1.0f && g_render_w && g_render_h) {
+        /* re-believed: the Hitman2.ini value IS the render resolution */
+        bw = (double)g_render_w;
+        bh = (double)g_render_h;
+    } else if (cfg > 1.0f) {
+        /* re-believe failed: plain supersample over the layout */
         bw = (double)g_ini_w * cfg;
         bh = (double)g_ini_h * cfg;
     } else {                                    /* auto (-1) */
@@ -1508,6 +1562,13 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
         pp->BackBufferWidth = (UINT)g_ini_w;
         pp->BackBufferHeight = (UINT)g_ini_h;
     }
+    /* UIScale re-believed: the engine lays out for g_ini (the patched
+     * layout resolution); the device renders at the Hitman2.ini (render)
+     * resolution. */
+    if (g_render_w && g_render_h) {
+        pp->BackBufferWidth = (UINT)g_render_w;
+        pp->BackBufferHeight = (UINT)g_render_h;
+    }
 
     /* Exclusive fullscreen — REAL WINDOWS ONLY. It needs the requested
      * resolution to be an actual enumerated display mode (else CreateDevice
@@ -1539,10 +1600,18 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
         choose_fs_interval(pp);
         g_borderless_active = 0;
         backdrop_hide();
-        if (h2sa_uiscale_wanted())
-            logf_("UIScale is not applied in exclusive fullscreen (the "
-                  "backbuffer must be an enumerated display mode)");
-        h2sa_uiscale_off();
+        if (g_render_w && g_render_h) {
+            /* re-believed UIScale works here: the backbuffer is the ini
+             * (render) resolution — an enumerated display mode — and the
+             * engine lays out for ini/scale. */
+            h2sa_uiscale_setup(g_ini_w, g_ini_h,
+                               pp->BackBufferWidth, pp->BackBufferHeight);
+        } else {
+            if (h2sa_uiscale_wanted())
+                logf_("UIScale is not applied in exclusive fullscreen (the "
+                      "backbuffer must be an enumerated display mode)");
+            h2sa_uiscale_off();
+        }
         logf_("present fixup (%s): exclusive fullscreen %ux%u (valid mode)",
               is_reset ? "reset" : "create",
               pp->BackBufferWidth, pp->BackBufferHeight);
@@ -1872,6 +1941,28 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         g_log = fopen(logpath, "w");
         read_config();
         read_game_resolution();
+        /* UIScale=N (>1): the Hitman2.ini Resolution is the RENDER
+         * resolution; the engine is made to believe (lay the UI out for)
+         * Resolution/N by patching its already-parsed copy in memory —
+         * see h2sa_uiscale_rebelieve in uiscale.c. Auto (-1) keeps the ini
+         * value as the layout and only grows the backbuffer later. */
+        if (g_enabled && g_uiscale_cfg > 1.0f && g_ini_w && g_ini_h) {
+            int lw = (int)(lround((double)g_ini_w / g_uiscale_cfg / 2.0) * 2);
+            int lh = (int)(lround((double)g_ini_h / g_uiscale_cfg / 2.0) * 2);
+            if (lw >= 320 && lh >= 200 &&
+                h2sa_uiscale_rebelieve(g_ini_w, g_ini_h, lw, lh) > 0) {
+                g_render_w = g_ini_w; g_render_h = g_ini_h;
+                g_ini_w = lw; g_ini_h = lh;
+                logf_("UIScale=%.2f: engine re-believed to layout %dx%d; "
+                      "Hitman2.ini %dx%d stays the render resolution",
+                      (double)g_uiscale_cfg, lw, lh, g_render_w, g_render_h);
+            } else {
+                logf_("UIScale=%.2f: engine resolution not re-believed — "
+                      "falling back to supersampling (backbuffer = scale x "
+                      "Hitman2.ini, UI size unchanged)",
+                      (double)g_uiscale_cfg);
+            }
+        }
         /* Disable the renderer's resolution-snap ladder before it runs, so
          * the Hitman2.ini resolution is used verbatim. RenderD3D is already
          * mapped (it is why our loader/this plugin were loaded), so this
@@ -1885,12 +1976,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         logf_("h2sa_core widescreen loaded%s, Fullscreen=%d Borderless=%d "
               "PreserveAspect=%d FOVCorrect=%d FOVFactor=%.2f FpsCap=%d "
               "VSync=%d MouseClipFix=%d MouseMotionFix=%d UIScale=%.2f, "
-              "Hitman2.ini resolution %dx%d",
+              "layout resolution %dx%d render %dx%d",
               g_enabled ? "" : " (disabled)",
               g_fullscreen, g_borderless, g_preserveaspect, g_fovcorrect,
               (double)g_fovfactor, g_fpscap, g_vsync, g_mouseclipfix,
-              g_mousemotionfix, (double)g_uiscale_cfg,
-              g_ini_w, g_ini_h);
+              g_mousemotionfix, (double)g_uiscale_cfg, g_ini_w, g_ini_h,
+              g_render_w ? g_render_w : g_ini_w,
+              g_render_h ? g_render_h : g_ini_h);
 
         HMODULE loader = GetModuleHandleA("d3d8.dll");
         h2sa_register_fn reg = loader ? (h2sa_register_fn)(uintptr_t)
@@ -1907,6 +1999,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
          * ini, registers its own on_frame hook with the loader */
         h2sa_profiler_init((HMODULE)inst);
     } else if (reason == DLL_PROCESS_DETACH) {
+        restore_ini_resolution();
         h2sa_profiler_detach();
     }
     return TRUE;

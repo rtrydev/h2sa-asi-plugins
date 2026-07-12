@@ -47,7 +47,13 @@
  *   UIScale=-1   ; -1 auto: backbuffer = the display's native (Retina)
  *                ; pixels for the letterboxed image — 1:1 present, max
  *                ; sharpness; UI sized as at the Hitman2.ini resolution.
- *                ; >1: explicit backbuffer multiplier over Hitman2.ini.
+ *                ; N>1: Hitman2.ini Resolution is the RENDER resolution and
+ *                ; the UI is laid out N x bigger (the engine is re-believed
+ *                ; to Resolution/N — see h2sa_uiscale_rebelieve below; works
+ *                ; in exclusive fullscreen too, since the backbuffer stays
+ *                ; the enumerated ini mode). If the re-believe scan finds
+ *                ; nothing, falls back to the old meaning: backbuffer =
+ *                ; N x Hitman2.ini, UI size unchanged (supersampling).
  *                ; 0/1: off (backbuffer = Hitman2.ini resolution as before).
  */
 #include <d3d8.h>
@@ -127,6 +133,78 @@ void h2sa_uiscale_setup(int ini_w, int ini_h, unsigned bb_w, unsigned bb_h)
     publish_to_loader((float)g_ky);
     logf_("uiscale: active — layout %dx%d -> backbuffer %ux%u (k=%.4f/%.4f)",
           ini_w, ini_h, bb_w, bb_h, g_kx, g_ky);
+}
+
+/* ---- re-believe: patch the engine's already-parsed resolution ---------
+ *
+ * With UIScale=N (>1) the Hitman2.ini Resolution is the RENDER resolution
+ * R and the engine must lay the UI out for L = R/N. The engine parses
+ * Hitman2.ini itself at startup — before it loads the renderer, which is
+ * what pulls in the d3d8 proxy and this plugin — so swapping the file
+ * would always be too late. But at plugin load we are INSIDE the engine's
+ * LoadLibrary(RenderD3D.dll) call: the ini is parsed, and nothing has
+ * consumed the value yet (no renderer init, no device, no UI layout).
+ * The parsed value is findable — an adjacent (width,height) pair equal to
+ * R, as ints or floats — in the engine's writable memory; patching every
+ * copy to L makes the engine believe L end to end, exactly as if the ini
+ * had said L, while the plugin keeps R as the backbuffer (and, in
+ * exclusive fullscreen, the display mode: R is an enumerated mode, so the
+ * scaling works there too, which plain backbuffer-growing could not).
+ *
+ * Scanned: hitman2.exe's image (the packer unpacks in place) plus all
+ * committed private RW memory (packer/heap allocations, other threads'
+ * stacks — a live (R_w,R_h) pair anywhere IS the parsed resolution; the
+ * engine main thread is parked inside LoadLibrary while we run). Our own
+ * module's globals are MEM_IMAGE of a different module and the region
+ * holding our stack is skipped, so the plugin's copies of R never
+ * self-match. Returns the number of sites patched; 0 = not found (the
+ * caller falls back to plain supersampling). */
+int h2sa_uiscale_rebelieve(int rw, int rh, int lw, int lh)
+{
+    const uint32_t ow = (uint32_t)rw, oh = (uint32_t)rh;
+    const uint32_t nw = (uint32_t)lw, nh = (uint32_t)lh;
+    const float owf = (float)rw, ohf = (float)rh;
+    const float nwf = (float)lw, nhf = (float)lh;
+    uint8_t *h2 = (uint8_t *)GetModuleHandleA("hitman2.exe");
+    MEMORY_BASIC_INFORMATION mbi;
+    uint8_t *p = (uint8_t *)0x10000;
+    int ints = 0, floats = 0;
+    while ((uintptr_t)p < 0x7fff0000u &&
+           VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+        uint8_t *base = (uint8_t *)mbi.BaseAddress;
+        SIZE_T   size = mbi.RegionSize;
+        int writable = mbi.State == MEM_COMMIT &&
+            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+        int engine_img = h2 && (uint8_t *)mbi.AllocationBase == h2;
+        int priv = mbi.Type == MEM_PRIVATE;
+        int our_stack = (uint8_t *)&mbi >= base && (uint8_t *)&mbi < base + size;
+        if (writable && (engine_img || priv) && !our_stack) {
+            for (uint8_t *q = base; q + 2 * sizeof(uint32_t) <= base + size;
+                 q += sizeof(uint32_t)) {
+                uint32_t *ip = (uint32_t *)q;
+                float    *fp = (float *)q;
+                if (ip[0] == ow && ip[1] == oh) {
+                    ip[0] = nw; ip[1] = nh;
+                    if (ints + floats < 8)
+                        logf_("uiscale: re-believe int pair at %p%s",
+                              q, engine_img ? " (hitman2.exe image)" : "");
+                    ints++;
+                } else if (fp[0] == owf && fp[1] == ohf) {
+                    fp[0] = nwf; fp[1] = nhf;
+                    if (ints + floats < 8)
+                        logf_("uiscale: re-believe float pair at %p%s",
+                              q, engine_img ? " (hitman2.exe image)" : "");
+                    floats++;
+                }
+            }
+        }
+        p = base + size;
+    }
+    logf_("uiscale: re-believe %dx%d -> %dx%d: %d int + %d float site(s)",
+          rw, rh, lw, lh, ints, floats);
+    return ints + floats;
 }
 
 /* ---- viewport rescale (fix_viewport hook) -----------------------------

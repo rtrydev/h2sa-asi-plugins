@@ -26,6 +26,7 @@ void h2sa_profiler_detach(void);
 void  h2sa_uiscale_config(float uiscale);
 float h2sa_uiscale_cfg(void);
 int   h2sa_uiscale_wanted(void);
+int   h2sa_uiscale_rebelieve(int rw, int rh, int lw, int lh);
 void  h2sa_uiscale_setup(int ini_w, int ini_h,
                          unsigned bb_w, unsigned bb_h);
 void  h2sa_uiscale_off(void);
