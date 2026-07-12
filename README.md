@@ -234,6 +234,55 @@ byte-offsets. (H2's `p5dll.dll` HID import drives the exotic **P5 data glove**,
 not the mouse — a red herring.) Set either to `0` to disable (both are off by
 default on real Windows, which needs neither).
 
+### UI scaling (`UIScale`)
+
+At a modern resolution the HUD and menus are tiny: the engine lays its whole
+2D layer out in **pixels against the `Hitman2.ini` resolution** (1 layout unit
+= 1 believed pixel; the HUD glyph quads are CPU-pre-transformed against it).
+There is no font-size or HUD-scale setting in the engine, its text is
+**pre-baked bitmap font atlases** (no runtime TrueType rasterizer, unlike
+Codename 47), and `hitman2.exe` — where the layout math lives — is packed, so
+none of the C47 HudScale/SharpText patch points exist here.
+
+The lever the engine *does* expose is the decoupling of what it **believes**
+from what the device **renders** (`UIScale`):
+
+- `Hitman2.ini Resolution` becomes the **UI layout resolution** — the game
+  believes it end-to-end (layout, anchors, mouse), so e.g. `1440x900` gives
+  the UI the size it had on a 900px-tall screen.
+- The plugin creates the **backbuffer larger**: with `UIScale=-1` (auto) at
+  the display's native (Retina) pixel size of the letterboxed image, so the
+  windowed present blits ~1:1 to physical pixels; with `UIScale=1.5` at an
+  explicit multiple of the ini resolution (cheaper than native).
+- The engine emits everything in normalized device coordinates derived from
+  the believed size, so the whole UI lands at the right place and relative
+  size on the bigger backbuffer automatically; only the **viewports** the
+  engine sets (in believed pixels) are rescaled by the plugin. The 3D scene
+  simply gains real resolution.
+
+The UI **textures** (font pages, icons, nine-slice borders) are magnified
+by the GPU's bilinear filter and simply keep their original art. Two
+sharpening approaches were built, verified and deliberately removed (both
+live in git history): a runtime refiltering pass (`UISharpen` — refiltering
+pre-baked bitmaps gains next to nothing while its builds cost frame drops)
+and an offline Real-ESRGAN texture-pack pipeline (`h2sa_texpack` — real
+quality on the font atlases, but hundreds of MB of pack data and an asset
+pipeline to maintain). **H2's text is pre-baked bitmap atlases**, unlike
+Codename 47, whose SharpText gets true high-resolution glyphs for free by
+patching the size of the game's own runtime TrueType rasterization — there
+is no equally free lever in H2, so this plugin keeps the free part only:
+the size.
+
+Overlays that draw in real backbuffer pixels (the profiler, and
+`h2_stats_overlay` since its UI-scale patch) multiply their glyph sizes by the
+loader's exported `H2SA_GetUIScale()`, so they keep their configured on-screen
+size.
+
+Suggested setup on this stack: `Resolution 1440x900` (UI as at 900p, 16:10)
+with `UIScale=-1` — verified to render 3600x2250 on a 1800x1169-logical Retina
+desktop with the HUD correctly scaled and 60 fps held. Exclusive fullscreen
+skips UIScale (the backbuffer must be an enumerated mode there).
+
 Config: `scripts/h2sa_core.ini`, `[Widescreen]` section
 
 ```ini
@@ -254,6 +303,9 @@ MouseClipFix=-1   ; fix the mouse-look edge wall (inset the renderer's full-
                   ; window cursor clip): -1 auto (on under Wine), 0 off, 1 on
 MouseMotionFix=-1 ; fix the slow-move stall (feed the DirectInput camera from
                   ; GetCursorPos): -1 auto (on under Wine), 0 off, 1 on
+UIScale=-1        ; render bigger than the Hitman2.ini resolution (which
+                  ; becomes the UI layout size): -1 auto = native (Retina)
+                  ; pixels, >1 = explicit multiplier, 0/1 = off
 ```
 
 ### Frame-rate cap

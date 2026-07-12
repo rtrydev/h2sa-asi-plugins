@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
 #include "h2sa_d3d8.h"
 #include "h2sa_core.h"
 
@@ -585,12 +586,17 @@ static void draw(IDirect3DDevice8 *dev)
 
     /* Identical glyph metric to h2-stats-overlay: cell = max(1, 2*Scale),
      * so a given Scale renders the same size in both plugins. Default Scale
-     * 1.0 => cell 2 (integer, so pixel-crisp; non-integer cells blur).
-     * Like it, no background panel — just outlined text. */
-    const float cell = 2.0f * g_scale < 1.0f ? 1.0f : 2.0f * g_scale;
+     * 1.0 => cell 2 (integer, so pixel-crisp; non-integer cells blur, hence
+     * the rounding). Like it, no background panel — just outlined text.
+     * The UI-scale factor keeps the overlay's ON-SCREEN size when the
+     * backbuffer is larger than the believed resolution (we draw in real
+     * backbuffer pixels). */
+    const float uk = h2sa_uiscale_k();
+    float cellf = 2.0f * g_scale * uk;
+    const float cell = cellf < 1.0f ? 1.0f : floorf(cellf + 0.5f);
     const float lh   = 9.0f * cell;                 /* line height */
-    const float right = (float)(vp.X + vp.Width - g_off_x);
-    float y = (float)(vp.Y + g_off_y);
+    const float right = (float)(vp.X + vp.Width) - (float)g_off_x * uk;
+    float y = (float)vp.Y + (float)g_off_y * uk;
 
     /* lines */
     char buf[48];
@@ -675,6 +681,7 @@ static const H2SAD3D8Hooks g_hooks = {
     NULL,        /* on_device      */
     NULL,        /* on_present     */
     on_frame,    /* on_frame       */
+    NULL,        /* fix_viewport   */
 };
 
 /* ------------------------------------------------------------------ */

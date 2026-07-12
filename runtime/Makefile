@@ -19,10 +19,11 @@ all: ../dist/d3d8.dll ../dist/h2sa_core.asi \
 	$(CC) $(CFLAGS) -o $@ asiloader.c d3d8.def $(LDFLAGS) \
 	      -Wl,--enable-stdcall-fixup -luser32 -lgdi32
 
-# core plugin: widescreen/startup/mouse fixes + the profiler overlay
-../dist/h2sa_core.asi: widescreen.c profiler.c h2sa_d3d8.h h2sa_core.h
+# core plugin: widescreen/startup/mouse fixes + UI scaling + the profiler
+# overlay
+../dist/h2sa_core.asi: widescreen.c profiler.c uiscale.c h2sa_d3d8.h h2sa_core.h
 	@mkdir -p ../dist
-	$(CC) $(CFLAGS) -o $@ widescreen.c profiler.c $(LDFLAGS) \
+	$(CC) $(CFLAGS) -o $@ widescreen.c profiler.c uiscale.c $(LDFLAGS) \
 	      -luser32 -lgdi32 -lwinmm
 
 ../dist/h2sa_reduced_x87.asi: h2sax87.c helpers.S

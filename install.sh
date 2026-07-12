@@ -35,6 +35,9 @@ if [ "$1" = "-u" ]; then
     rm -f "$GAME/scripts/h2sa_asi_loader.log"
     rm -f "$GAME/scripts/h2sa_core.asi"
     rm -f "$GAME/scripts/h2sa_core.log"
+    rm -f "$GAME/scripts/h2sa_texpack.asi"
+    rm -f "$GAME/scripts/h2sa_texpack.ini"
+    rm -f "$GAME/scripts/h2sa_texpack.log"
     rm -f "$GAME/scripts/h2sa_reduced_x87.asi"
     rm -f "$GAME/scripts/h2sa_reduced_x87_diag.asi"
     rm -f "$GAME/scripts/h2sa_reduced_x87.log"
@@ -76,9 +79,28 @@ cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 # performance profiler overlay (top-right; [Profiler] section of the ini).
 cp "$HERE/dist/h2sa_core.asi" "$GAME/scripts/"
 if [ ! -f "$GAME/scripts/h2sa_core.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nPreserveAspect=1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nMouseClipFix=-1\nMouseMotionFix=-1\n\n[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=1\nOffsetX=8\nOffsetY=8\n' \
+    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nPreserveAspect=1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nMouseClipFix=-1\nMouseMotionFix=-1\nUIScale=-1\n\n[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=1\nOffsetX=8\nOffsetY=8\n' \
         > "$GAME/scripts/h2sa_core.ini"
+elif ! grep -q '^[[:space:]]*UIScale' "$GAME/scripts/h2sa_core.ini"; then
+    # migrate an existing config: enable the UI scale feature (UIScale=-1
+    # renders at native pixels; Hitman2.ini Resolution becomes the UI size)
+    awk '{ print } /^\[Widescreen\]/ { print "UIScale=-1" }' \
+        "$GAME/scripts/h2sa_core.ini" > "$GAME/scripts/h2sa_core.ini.tmp" \
+        && mv "$GAME/scripts/h2sa_core.ini.tmp" "$GAME/scripts/h2sa_core.ini"
+    echo "h2sa_core.ini: added UIScale=-1 to [Widescreen]"
 fi
+# drop the retired UISharpen key from earlier builds (harmless but stale)
+if grep -q '^[[:space:]]*UISharpen' "$GAME/scripts/h2sa_core.ini" 2>/dev/null; then
+    grep -v '^[[:space:]]*UISharpen' "$GAME/scripts/h2sa_core.ini" \
+        > "$GAME/scripts/h2sa_core.ini.tmp" \
+        && mv "$GAME/scripts/h2sa_core.ini.tmp" "$GAME/scripts/h2sa_core.ini"
+fi
+
+# The HD texture pack experiment (h2sa_texpack) was removed — clean up a
+# previous install of it. Its data dir (dumps/pack) is user data and is
+# left alone if present.
+rm -f "$GAME/scripts/h2sa_texpack.asi" "$GAME/scripts/h2sa_texpack.ini" \
+      "$GAME/scripts/h2sa_texpack.log"
 
 # Reduced-precision x87 plugin: SSE2-translated RenderD3D.dll for CrossOver
 # performance. The .asi loads any <module>.x87 blob from scripts/h2sa_reduced_x87/.

@@ -67,6 +67,11 @@
  *                   ; the cap (present every Nth vblank when refresh = N*cap),
  *                   ; else vsync every frame; 0 off (software cap only, may
  *                   ; tear); 1 force vsync-every-frame
+ *   UIScale=-1      ; decouple the render resolution from the Hitman2.ini
+ *                   ; Resolution (which becomes the UI LAYOUT size): -1 auto
+ *                   ; = render at the display's native (Retina) pixels, >1 =
+ *                   ; explicit backbuffer multiplier, 0/1 = off. See
+ *                   ; uiscale.c for the design and the approaches rejected.
  */
 #include <d3d8.h>
 #include <stdio.h>
@@ -117,10 +122,20 @@ static int g_mousemotionfix = -1;  /* feed the DirectInput camera motion from th
                                     * absolute OS cursor (GetCursorPos) instead of
                                     * winemac's lossy relative axis, fixing the
                                     * slow-move stall: -1 auto (Wine), 0 off, 1 on */
+static float g_uiscale_cfg = 0.0f; /* [Widescreen] UIScale: 0/1 off, -1 auto
+                                    * (native-pixel backbuffer), >1 explicit
+                                    * multiplier over the Hitman2.ini res */
+static int g_mode_w, g_mode_h;     /* adapter display mode (physical pixels;
+                                    * on Retina = 2x the logical desktop) */
 static HWND g_game_hwnd;           /* the game window, learned at device init */
+
+/* uiscale.c hook (D3D-typed, so declared here rather than h2sa_core.h) */
+void h2sa_uiscale_fix_viewport(D3DVIEWPORT8 *vp, unsigned int bbw,
+                               unsigned int bbh);
 static volatile DWORD g_fg_deadline; /* startup-activation window still open */
 static volatile DWORD g_next_kick;   /* earliest tick for the next kick */
 static volatile int g_kicks_left;    /* remaining startup activation kicks */
+static volatile DWORD g_last_present; /* tick of the last completed Present */
 
 void h2sa_core_logf(const char *fmt, ...)
 {
@@ -185,10 +200,16 @@ static void read_config(void)
         else if (sscanf(line, " VSync = %d", &b) == 1 ||
                  sscanf(line, " VSync=%d", &b) == 1)
             g_vsync = b < 0 ? -1 : (b != 0);
+        else if (sscanf(line, " UIScale = %f", &v) == 1 ||
+                 sscanf(line, " UIScale=%f", &v) == 1)
+            g_uiscale_cfg = v;
     }
     fclose(f);
     if (!(g_fovfactor >= 0.5f && g_fovfactor <= 2.0f)) g_fovfactor = 1.0f;
     if (g_fpscap < 0 || g_fpscap > 1000) g_fpscap = 60;
+    if (g_uiscale_cfg < 0.0f) g_uiscale_cfg = -1.0f;          /* auto */
+    else if (g_uiscale_cfg > 8.0f) g_uiscale_cfg = 8.0f;
+    h2sa_uiscale_config(g_uiscale_cfg);
 }
 
 /* Parse "Resolution WxH" from Hitman2.ini in the game root (the parent of
@@ -949,10 +970,11 @@ static void kick_app_activation(HWND hwnd)
     }
     /* Arm activation on the game window's thread, then hand foreground back:
      * the arm message is queued to that thread before the focus event, so it
-     * is consumed by the set_focus that follows and the app activates. */
+     * is consumed by the set_focus that follows and the app activates. (No
+     * cross-thread SetFocus here — it is invalid from this watcher thread
+     * and the focus event already comes from the foreground change.) */
     PostMessageA(hwnd, WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS, 0, 0);
     SetForegroundWindow(hwnd);
-    SetFocus(hwnd);
     if (tmp) {
         ShowWindow(tmp, SW_HIDE);
         DestroyWindow(tmp);
@@ -1019,20 +1041,28 @@ static DWORD WINAPI cursor_watch(LPVOID arg)
         hook_dinput();       /* slow-move fix: feed DI mouse from GetCursorPos */
         if ((tick % 25) == 0)          /* every ~500ms */
             backdrop_maintain();       /* keep letterbox bars black + beneath */
-        if (!cursorfix_wanted())
-            continue;
-        if ((tick % 10) == 0)          /* rescan for new threads at 5 Hz */
-            EnumWindows(hook_thread_of_window, 0);
-        nudge_cursor_off_edges();      /* backstop between input messages */
-        HWND w = g_game_hwnd;
         /* Startup activation: reproduce a user click a few times over the
          * first couple of seconds so the macOS app activates (menu bar hides
-         * / display captures) without needing a real click. A handful of
-         * spaced kicks covers the case where the first fires before the
-         * Cocoa window is ready; macOS then keeps us active. */
-        if (g_fg_deadline && w && IsWindow(w)) {
+         * / display captures / the borderless window actually maps) without
+         * needing a real click. A handful of spaced kicks covers the case
+         * where the first fires before the Cocoa window is ready; macOS then
+         * keeps us active. NOT gated on CursorFix: a Steam-launched process
+         * gets no macOS activation for free, and without it the window never
+         * appears and the engine sits paused in the background.
+         *
+         * Only kick while the game has PRESENTED within the last 500ms: the
+         * kick does cross-thread window operations (foreground bounce), and
+         * poking a game thread that is not pumping messages (a load hitch)
+         * can deadlock both threads inside win32u — observed as a frozen
+         * game with two kicks sent and the watcher stuck. A presenting game
+         * is a pumping game, so this gate makes the kick safe; a deferred
+         * kick simply fires on a later tick within the deadline. */
+        if (is_wine() && g_fg_deadline) {
+            HWND w = g_game_hwnd;
             DWORD now = GetTickCount();
-            if (now >= g_next_kick && g_kicks_left > 0) {
+            DWORD lp = g_last_present;
+            if (w && IsWindow(w) && now >= g_next_kick && g_kicks_left > 0 &&
+                lp && now - lp < 500) {
                 kick_app_activation(w);
                 g_kicks_left--;
                 g_next_kick = now + 500;
@@ -1042,6 +1072,29 @@ static DWORD WINAPI cursor_watch(LPVOID arg)
                 }
             }
         }
+        /* Soft re-activation: if the game window loses foreground later
+         * (macOS gives focus elsewhere; the engine then auto-pauses), take
+         * it back. Only non-blocking calls — PostMessage + a wineserver-
+         * side foreground change; no window creation, no focus bounce —
+         * so it is safe even against a non-pumping game thread. */
+        if (is_wine() && g_borderless_active && (tick % 150) == 0) {
+            HWND w = g_game_hwnd;
+            if (w && IsWindow(w) && GetForegroundWindow() != w) {
+                PostMessageA(w, WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS, 0, 0);
+                SetForegroundWindow(w);
+                static LONG logs;
+                if (logs < 10) {
+                    InterlockedIncrement(&logs);
+                    logf_("foreground lost — soft re-activation sent");
+                }
+            }
+        }
+        if (!cursorfix_wanted())
+            continue;
+        if ((tick % 10) == 0)          /* rescan for new threads at 5 Hz */
+            EnumWindows(hook_thread_of_window, 0);
+        nudge_cursor_off_edges();      /* backstop between input messages */
+        HWND w = g_game_hwnd;
         if (w && IsWindow(w) &&
             (HCURSOR)(uintptr_t)GetClassLongA(w, GCL_HCURSOR) != NULL) {
             SetClassLongA(w, GCL_HCURSOR, 0);
@@ -1244,11 +1297,18 @@ static void read_caps_once(void)
      * the borderless path worked under CrossOver but not on real Windows). */
     D3DDISPLAYMODE mode;
     if (SUCCEEDED(d->lpVtbl->GetAdapterDisplayMode(d, D3DADAPTER_DEFAULT,
-                                                   &mode)))
+                                                   &mode))) {
         g_desktop_fmt = mode.Format;
+        /* physical pixels — on a Retina Mac this is 2x the logical desktop
+         * GetSystemMetrics reports; UIScale's auto mode targets it */
+        g_mode_w = (int)mode.Width;
+        g_mode_h = (int)mode.Height;
+    }
     d->lpVtbl->Release(d);
-    logf_("device present-interval caps = 0x%08lx, desktop fmt = %d",
-          (unsigned long)g_present_intervals, g_desktop_fmt);
+    logf_("device present-interval caps = 0x%08lx, desktop fmt = %d, "
+          "adapter mode %dx%d",
+          (unsigned long)g_present_intervals, g_desktop_fmt,
+          g_mode_w, g_mode_h);
 }
 
 /* Is w x h @ refresh Hz an enumerated 32-bit display mode? */
@@ -1363,6 +1423,62 @@ static void pace_recalibrate(const char *why)
     logf_("frame pacing: recalibrating (%s)", why);
 }
 
+/* UIScale backbuffer selection. The engine keeps believing (laying the UI
+ * out for) the Hitman2.ini resolution; we render into a LARGER backbuffer:
+ *  - auto (-1): the native (Retina) pixel size of the letterboxed image, so
+ *    the windowed present blits ~1:1 to physical pixels — maximum 3D/UI
+ *    sharpness with no scaling pass. Computed as the largest ini-aspect fit
+ *    of the logical desktop, times the physical/logical ratio taken from
+ *    the adapter display mode (2x on Retina).
+ *  - explicit k>1: k times the Hitman2.ini resolution (e.g. 1.333 sizes the
+ *    UI as at 900p while rendering 1200p, without paying for native).
+ * The engine-facing consequences (viewports in believed pixels, magnified
+ * UI textures) are handled by uiscale.c via the loader's v4 hooks. */
+static void uiscale_pick_backbuffer(D3DPRESENT_PARAMETERS *pp, int dw, int dh)
+{
+    float cfg = h2sa_uiscale_cfg();
+    if (!h2sa_uiscale_wanted() || !g_ini_w || !g_ini_h) {
+        h2sa_uiscale_off();
+        return;
+    }
+    double bw, bh;
+    if (cfg > 1.0f) {
+        bw = (double)g_ini_w * cfg;
+        bh = (double)g_ini_h * cfg;
+    } else {                                    /* auto (-1) */
+        if (dw < 320 || dh < 200) {
+            logf_("UIScale auto: desktop size unknown — off");
+            h2sa_uiscale_off();
+            return;
+        }
+        double retina = (g_mode_h > 0) ? (double)g_mode_h / dh : 1.0;
+        if (retina < 1.0) retina = 1.0;
+        double tw = dw, th = dh;
+        if (g_preserveaspect) {                 /* the letterboxed image */
+            double img = (double)g_ini_w / (double)g_ini_h;
+            double scr = (double)dw / (double)dh;
+            if (img > scr) { tw = dw; th = dw / img; }
+            else           { th = dh; tw = dh * img; }
+        }
+        bw = tw * retina;
+        bh = th * retina;
+    }
+    unsigned ubw = (unsigned)(lround(bw / 2.0) * 2);   /* even, sane */
+    unsigned ubh = (unsigned)(lround(bh / 2.0) * 2);
+    if (ubw > 8192) ubw = 8192;
+    if (ubh > 8192) ubh = 8192;
+    if ((double)ubh < (double)g_ini_h * 1.02 ||
+        (double)ubw < (double)g_ini_w * 1.02) {
+        logf_("UIScale: target %ux%u is not larger than the layout "
+              "resolution %dx%d — staying off", ubw, ubh, g_ini_w, g_ini_h);
+        h2sa_uiscale_off();
+        return;
+    }
+    pp->BackBufferWidth = ubw;
+    pp->BackBufferHeight = ubh;
+    h2sa_uiscale_setup(g_ini_w, g_ini_h, ubw, ubh);
+}
+
 /* Presentation-parameters fixup: force windowed (the startup fix) and,
  * when borderless is wanted, expand to the desktop and strip the window. */
 static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
@@ -1423,6 +1539,10 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
         choose_fs_interval(pp);
         g_borderless_active = 0;
         backdrop_hide();
+        if (h2sa_uiscale_wanted())
+            logf_("UIScale is not applied in exclusive fullscreen (the "
+                  "backbuffer must be an enumerated display mode)");
+        h2sa_uiscale_off();
         logf_("present fixup (%s): exclusive fullscreen %ux%u (valid mode)",
               is_reset ? "reset" : "create",
               pp->BackBufferWidth, pp->BackBufferHeight);
@@ -1473,6 +1593,12 @@ static void fix_present(D3DPRESENT_PARAMETERS *pp, HWND hFocusWindow,
      * cost sane on Retina (the OS upscales to native pixels). */
     int dw = GetSystemMetrics(SM_CXSCREEN);
     int dh = GetSystemMetrics(SM_CYSCREEN);
+
+    /* UI scale: possibly grow the backbuffer past the believed (Hitman2.ini)
+     * resolution; the letterbox math below then sizes the window from the
+     * (unchanged) backbuffer aspect. */
+    uiscale_pick_backbuffer(pp, dw, dh);
+
     HWND hwnd = devwnd;
     int letterbox = 0;
     if (g_borderless_active && dw >= 320 && dh >= 200 && hwnd) {
@@ -1638,6 +1764,7 @@ static void wait_until(LONGLONG deadline, LONGLONG freq)
  * signal it is measuring for. */
 static void frame_limit(void)      /* on_present: after Present returned */
 {
+    g_last_present = GetTickCount();   /* activation-kick safety gate */
     if (g_fpscap <= 0) return;
 
     LARGE_INTEGER now;
@@ -1726,6 +1853,7 @@ static const H2SAD3D8Hooks g_hooks = {
     NULL,           /* on_device */
     frame_limit,    /* on_present: calibration / HW bookkeeping */
     frame_pace_pre, /* on_frame: committed SW limiter waits before Present */
+    h2sa_uiscale_fix_viewport,  /* believed-space viewports -> backbuffer */
 };
 
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
@@ -1756,12 +1884,13 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
         logf_("h2sa_core widescreen loaded%s, Fullscreen=%d Borderless=%d "
               "PreserveAspect=%d FOVCorrect=%d FOVFactor=%.2f FpsCap=%d "
-              "VSync=%d MouseClipFix=%d MouseMotionFix=%d, Hitman2.ini "
-              "resolution %dx%d",
+              "VSync=%d MouseClipFix=%d MouseMotionFix=%d UIScale=%.2f, "
+              "Hitman2.ini resolution %dx%d",
               g_enabled ? "" : " (disabled)",
               g_fullscreen, g_borderless, g_preserveaspect, g_fovcorrect,
               (double)g_fovfactor, g_fpscap, g_vsync, g_mouseclipfix,
-              g_mousemotionfix, g_ini_w, g_ini_h);
+              g_mousemotionfix, (double)g_uiscale_cfg,
+              g_ini_w, g_ini_h);
 
         HMODULE loader = GetModuleHandleA("d3d8.dll");
         h2sa_register_fn reg = loader ? (h2sa_register_fn)(uintptr_t)

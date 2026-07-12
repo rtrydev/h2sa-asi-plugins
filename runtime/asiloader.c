@@ -31,6 +31,7 @@
 #include <d3d8.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <string.h>
 #include "h2sa_d3d8.h"
 
@@ -57,6 +58,7 @@ static void *g_orig_settransform;
 static void *g_orig_setviewport;
 static unsigned int g_bbw, g_bbh;   /* backbuffer size of the live device */
 static int g_vp_logs, g_proj_logs;  /* diagnostic sample counters */
+static volatile float g_uiscale = 1.0f;  /* backbuffer/believed height ratio */
 
 static void logf_(const char *fmt, ...)
 {
@@ -119,6 +121,19 @@ static HRESULT WINAPI hook_SetViewport(IDirect3DDevice8 *self,
      * is clamped to the full backbuffer — that restores correct rendering
      * without touching game code. Legitimate sub-viewports (HUD elements etc.)
      * fit and pass through untouched. */
+    D3DVIEWPORT8 scaled;
+    if (vp) {
+        /* Plugins first (UI scale: engine viewports arrive in the believed
+         * Hitman2.ini resolution and are rescaled to the real backbuffer);
+         * the garbage clamp below then sees the rescaled values. */
+        int any = 0;
+        for (int i = 0; i < g_n_hooks; i++)
+            if (g_hooks[i].fix_viewport) {
+                if (!any) { scaled = *vp; any = 1; }
+                g_hooks[i].fix_viewport(&scaled, g_bbw, g_bbh);
+            }
+        if (any) vp = &scaled;
+    }
     D3DVIEWPORT8 fixed;
     if (vp && g_bbw && g_bbh &&
         (vp->X + vp->Width > g_bbw || vp->Y + vp->Height > g_bbh ||
@@ -322,9 +337,12 @@ __declspec(dllexport) DWORD WINAPI D3D8GetSWInfo(void)
 __declspec(dllexport) void WINAPI H2SA_RegisterD3D8Hooks(
     const H2SAD3D8Hooks *hooks)
 {
-    if (!hooks || hooks->version != H2SA_D3D8_HOOKS_VERSION) {
-        logf_("H2SA_RegisterD3D8Hooks: version mismatch (%u != %u)",
-              hooks ? hooks->version : 0, H2SA_D3D8_HOOKS_VERSION);
+    /* v3 structs (no fix_viewport/map_texture tail) stay accepted: the tail
+     * is zero-filled, so the new callbacks simply never fire for them. */
+    if (!hooks || hooks->version < 3 ||
+        hooks->version > H2SA_D3D8_HOOKS_VERSION) {
+        logf_("H2SA_RegisterD3D8Hooks: version mismatch (%u, loader speaks "
+              "3..%u)", hooks ? hooks->version : 0, H2SA_D3D8_HOOKS_VERSION);
         return;
     }
     if (g_n_hooks >= MAX_HOOKSETS) {
@@ -332,11 +350,32 @@ __declspec(dllexport) void WINAPI H2SA_RegisterD3D8Hooks(
         return;
     }
     H2SAD3D8Hooks *h = &g_hooks[g_n_hooks++];
-    *h = *hooks;
-    logf_("plugin #%d registered D3D8 hooks (fix_present=%p fix_projection=%p "
-          "on_device=%p on_frame=%p on_present=%p)", g_n_hooks,
+    memset(h, 0, sizeof(*h));
+    size_t v3_size = offsetof(H2SAD3D8Hooks, fix_viewport);
+    memcpy(h, hooks, hooks->version >= 4 ? sizeof(*h) : v3_size);
+    logf_("plugin #%d registered D3D8 hooks v%u (fix_present=%p "
+          "fix_projection=%p on_device=%p on_frame=%p on_present=%p "
+          "fix_viewport=%p)", g_n_hooks, hooks->version,
           (void *)h->fix_present, (void *)h->fix_projection,
-          (void *)h->on_device, (void *)h->on_frame, (void *)h->on_present);
+          (void *)h->on_device, (void *)h->on_frame, (void *)h->on_present,
+          (void *)h->fix_viewport);
+}
+
+/* UI-scale rendezvous: the widescreen plugin publishes the vertical
+ * backbuffer/believed-resolution ratio here; overlay plugins that draw in
+ * real backbuffer pixels (profiler, h2_stats_overlay) multiply their glyph
+ * sizes by it so their text keeps its on-screen size when the backbuffer
+ * grows. 1.0 = UI scaling off. */
+__declspec(dllexport) void WINAPI H2SA_SetUIScale(float k)
+{
+    if (!(k >= 0.25f && k <= 16.0f)) k = 1.0f;
+    g_uiscale = k;
+    logf_("UI scale published: %.4f", (double)k);
+}
+
+__declspec(dllexport) float WINAPI H2SA_GetUIScale(void)
+{
+    return g_uiscale;
 }
 
 /* ---- ASI loading ----------------------------------------------------- */

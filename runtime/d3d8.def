@@ -9,3 +9,5 @@ EXPORTS
     ValidatePixelShader @4
     ValidateVertexShader @5
     H2SA_RegisterD3D8Hooks
+    H2SA_SetUIScale
+    H2SA_GetUIScale

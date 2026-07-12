@@ -22,7 +22,7 @@
 
 #include <d3d8.h>
 
-#define H2SA_D3D8_HOOKS_VERSION 3
+#define H2SA_D3D8_HOOKS_VERSION 4
 
 typedef struct H2SAD3D8Hooks {
     unsigned int version;   /* set to H2SA_D3D8_HOOKS_VERSION */
@@ -59,12 +59,30 @@ typedef struct H2SAD3D8Hooks {
      * already shown). The scene has ended by this point; a plugin that draws
      * must save/restore device state around its own draw calls. */
     void (*on_frame)(IDirect3DDevice8 *dev);
+
+    /* ---- version 4 fields (absent in v3 registrations; the loader
+     * zero-fills them for a v3 plugin) ---- */
+
+    /* Optional (may be NULL): called for every IDirect3DDevice8::SetViewport
+     * on a private copy the loader then forwards (before the loader's own
+     * garbage-viewport clamp). Used by the UI-scale feature: the engine sets
+     * viewports in its believed (Hitman2.ini) resolution while the backbuffer
+     * is larger, so the plugin rescales them here. bbw/bbh are the live
+     * backbuffer size. */
+    void (*fix_viewport)(D3DVIEWPORT8 *vp, unsigned int bbw, unsigned int bbh);
 } H2SAD3D8Hooks;
 
 /* Multiple plugins may register; the loader keeps every hook set and invokes
  * each non-NULL callback in registration order. fix_present / fix_projection
- * are applied in turn (each sees the previous plugin's edits). */
+ * are applied in turn (each sees the previous plugin's edits). Registration
+ * accepts version 3 structs too (the v4 tail is zero-filled). */
 
 typedef void (WINAPI *h2sa_register_fn)(const H2SAD3D8Hooks *hooks);
+
+/* The loader also exports (for overlay plugins that draw in real backbuffer
+ * pixels and want to match the game UI's size):
+ *   void  WINAPI H2SA_SetUIScale(float k);   // set by the widescreen plugin
+ *   float WINAPI H2SA_GetUIScale(void);      // 1.0 when UI scaling is off
+ * k is the vertical backbuffer/believed-resolution ratio. */
 
 #endif /* H2SA_D3D8_H */
