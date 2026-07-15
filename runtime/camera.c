@@ -242,7 +242,59 @@ static int probe_exe(void)
  *    a cached stale copy is corrected shortly after the new scene is up.
  *
  * Reads only; the present thread re-validates the candidate in place
- * before writing. */
+ * before writing.
+ *
+ * Every read of scanned memory goes through ReadProcessMemory, never a
+ * direct dereference: the game frees heap blocks on its main thread WHILE
+ * the sweep runs (level load especially), and Wine's heap decommits freed
+ * pages far more eagerly than the Windows heap — a region that was
+ * MEM_COMMIT at VirtualQuery time can lose pages mid-sweep (observed as a
+ * page-fault crash on level load under CrossOver; never bites on real
+ * Windows, where the freed pages stay committed). RPM turns the vanished
+ * page into a failed/short read. The present thread is exempt: frees
+ * happen on that same thread, so nothing decommits under it. */
+static int safe_read(const void *src, void *dst, size_t n)
+{
+    SIZE_T got = 0;
+    return ReadProcessMemory(GetCurrentProcess(), src, dst, n, &got) &&
+           got == n;
+}
+
+/* cam_valid + active-flag check, on RPM'd copies (scanner-thread version;
+ * keep the field checks in sync with cam_valid above). Returns the boom
+ * pointer, its stamp and the two distances for the caller's pick/logging
+ * so the caller never touches the candidate's memory directly. */
+static int cam_probe(uint8_t *cand, uint8_t **boom_out, uint32_t *stamp_out,
+                     float *cur_out, float *pref_out)
+{
+    uint8_t camb[CAM_SIZE], boomb[BOOM_SIZE];
+    uint32_t vptr;
+    uint8_t *boom;
+    if (!safe_read(cand, camb, sizeof(camb)))
+        return 0;
+    memcpy(&vptr, camb, sizeof(vptr));
+    if (vptr != VA_STICKCAM_VTBL || !camb[OFF_CAM_ACTIVE])
+        return 0;
+    memcpy(&boom, camb + OFF_CAM_BOOM, sizeof(boom));   /* packed: unaligned */
+    if (!safe_read(boom, boomb, sizeof(boomb)))
+        return 0;
+    float pref  = fld32(camb, OFF_CAM_PREFERRED);
+    float near_ = fld32(boomb, OFF_BOOM_NEAROFF);
+    float meas  = fld32(boomb, OFF_BOOM_MEASURED);
+    if (!(pref >= 10.0f && pref <= 1000.0f &&
+          near_ >= -1000.0f && near_ <= 1000.0f && meas >= 0.0f))
+        return 0;
+    *boom_out = boom;
+    memcpy(stamp_out, boomb + OFF_BOOM_STAMP, sizeof(*stamp_out));
+    *cur_out  = fld32(camb, OFF_CAM_CURRENT);
+    *pref_out = pref;
+    return 1;
+}
+
+/* sweep buffer: .bss of this module is MEM_IMAGE, so the sweep (which only
+ * looks at MEM_PRIVATE) never sees its own copies of the vtable constant */
+static uint8_t g_scan_buf[0x10000];
+
 #define RESCAN_MS 3000
 static DWORD WINAPI scan_thread(LPVOID arg)
 {
@@ -251,8 +303,9 @@ static DWORD WINAPI scan_thread(LPVOID arg)
         if (g_state == 0)
             return 0;
         if (g_state == 1) {
-            uint8_t *found = NULL;
+            uint8_t *found = NULL, *found_boom = NULL;
             uint32_t found_dist = 0xffffffffu;
+            float found_cur = 0.0f, found_pref = 0.0f;
             uint32_t now_ms = 0;
             uint8_t *eng = *(uint8_t **)(uintptr_t)VA_ENGINE_DB;
             if (readable(eng, OFF_DB_TIME_MS + 4))
@@ -273,51 +326,74 @@ static DWORD WINAPI scan_thread(LPVOID arg)
                  * vtable constant we are scanning for */
                 if ((uint8_t *)&mbi >= base && (uint8_t *)&mbi < base + size)
                     ok = 0;
-                if (ok) {
+                SIZE_T off = 0;
+                while (ok && off < (size & ~(SIZE_T)3)) {
+                    SIZE_T want = (size & ~(SIZE_T)3) - off;
+                    SIZE_T got = 0;
+                    if (want > sizeof(g_scan_buf))
+                        want = sizeof(g_scan_buf);
+                    if (!ReadProcessMemory(GetCurrentProcess(), base + off,
+                                           g_scan_buf, want, &got) && !got) {
+                        /* Windows RPM is all-or-nothing across a hole:
+                         * retry one page, then skip it if it is the hole */
+                        want = 0x1000;
+                        if (!ReadProcessMemory(GetCurrentProcess(),
+                                               base + off, g_scan_buf,
+                                               want, &got) && !got) {
+                            off += 0x1000;
+                            continue;
+                        }
+                    }
+                    got &= ~(SIZE_T)3;
                     /* operator new returns 4-aligned blocks: the vptr sits
                      * at a 4-aligned address even in this packed engine */
-                    uint32_t *q = (uint32_t *)base;
-                    uint32_t *end = (uint32_t *)(base + (size & ~3u)) - 1;
-                    for (; q < end; q++) {
-                        if (*q != VA_STICKCAM_VTBL)
+                    for (SIZE_T i = 0; i + 4 <= got; i += 4) {
+                        uint32_t v;
+                        memcpy(&v, g_scan_buf + i, sizeof(v));
+                        if (v != VA_STICKCAM_VTBL)
                             continue;
-                        uint8_t *cand = (uint8_t *)q;
-                        if (!cam_valid(cand) || !cand[OFF_CAM_ACTIVE])
-                            continue;
+                        uint8_t *cand = base + off + i;
                         uint8_t *boom;
                         uint32_t stamp;
-                        memcpy(&boom, cand + OFF_CAM_BOOM, sizeof(boom));
-                        memcpy(&stamp, boom + OFF_BOOM_STAMP, sizeof(stamp));
+                        float cur, pref;
+                        if (!cam_probe(cand, &boom, &stamp, &cur, &pref))
+                            continue;
                         uint32_t d = now_ms - stamp;    /* distance to now */
                         if (d > 0x80000000u) d = 0u - d;
                         if (!found || d < found_dist) {
                             found = cand;
                             found_dist = d;
+                            found_boom = boom;
+                            found_cur = cur;
+                            found_pref = pref;
                         }
                     }
+                    off += got ? got : 0x1000;   /* keep 4-aligned progress */
                 }
                 p = base + size;
                 if (p < base) break;                /* address wrap */
             }
             if (found &&
                 (uint8_t *)(uintptr_t)g_cam_found != found) {
-                uint8_t *boom;
-                memcpy(&boom, found + OFF_CAM_BOOM, sizeof(boom));
                 logf_("camera: HM2StickCam at %p (boom %p), "
-                      "current=%.1f preferred=%.1f", found, boom,
-                      (double)fld32(found, OFF_CAM_CURRENT),
-                      (double)fld32(found, OFF_CAM_PREFERRED));
+                      "current=%.1f preferred=%.1f", found, found_boom,
+                      (double)found_cur, (double)found_pref);
             }
             if (found)
                 InterlockedExchange(&g_cam_found, (LONG)(uintptr_t)found);
         }
         /* no active camera yet (menus, loading): retry quickly so the fix
          * is in place moments after a mission starts */
-        if (!cam_valid((uint8_t *)(uintptr_t)g_cam_found) ||
-            !((uint8_t *)(uintptr_t)g_cam_found)[OFF_CAM_ACTIVE])
-            Sleep(1000);
-        else
-            Sleep(RESCAN_MS);
+        {
+            uint8_t *boom;
+            uint32_t stamp;
+            float cur, pref;
+            if (!cam_probe((uint8_t *)(uintptr_t)g_cam_found,
+                           &boom, &stamp, &cur, &pref))
+                Sleep(1000);
+            else
+                Sleep(RESCAN_MS);
+        }
     }
 }
 
