@@ -18,6 +18,12 @@ void h2sa_core_logf(const char *fmt, ...);
 void h2sa_profiler_init(HMODULE self);
 void h2sa_profiler_detach(void);
 
+/* camera.c — auto zoom-out for the third-person camera ([Camera] section).
+ * init parses the ini; frame runs once per displayed frame from
+ * widescreen.c's on_present hook (the game's main thread). */
+void h2sa_camera_init(void);
+void h2sa_camera_frame(void);
+
 /* uiscale.c — believed-resolution UI scaling. widescreen.c forwards the
  * [Widescreen] UIScale config, decides the backbuffer size in fix_present
  * and calls setup/off; the fix_viewport hook goes into widescreen.c's v4

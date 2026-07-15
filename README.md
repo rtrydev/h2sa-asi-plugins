@@ -97,9 +97,10 @@ present, so launch it the normal way (through the Steam client, appid
 ## Plugin: Core (`h2sa_core.asi`) — widescreen, startup, input, pacing
 
 The core plugin bundles everything that adapts the game to a modern system:
-the startup/widescreen fix, the winemac mouse fixes, the frame-rate cap and
-the profiler overlay (documented in its own section below). Each feature is
-configured from its section of `scripts/h2sa_core.ini`.
+the startup/widescreen fix, the winemac mouse fixes, the frame-rate cap, the
+camera auto zoom-out and the profiler overlay (documented in its own section
+below). Each feature is configured from its section of
+`scripts/h2sa_core.ini`.
 
 Two problems on a modern Mac, both handled at the D3D8 boundary:
 
@@ -323,6 +324,60 @@ UIScale=-1        ; -1 auto = render at native (Retina) pixels, UI laid out
                   ; works in exclusive fullscreen); 0/1 = off
 ```
 
+### Camera auto zoom-out (`[Camera]` section)
+
+The third-person camera (the engine's `HM2StickCamera`) zooms in when level
+geometry blocks the line to the camera, but does not swing back out when the
+obstruction clears: the camera boom keeps a **ratcheted "allowed length"**
+that follows the measured free distance down immediately but only grows back
+after a 5.12-second cooldown — whose timestamp is refreshed on every change,
+so after leaving a tight spot the camera stays zoomed for seconds unless the
+player scrolls the wheel (the zoom-out scroll resets the ratchet directly,
+which is why scrolling always fixed it instantly).
+
+`AutoZoomOut=1` prioritizes the zoomed-out view with two per-frame **data
+writes** into the live camera object (no code is patched, so it coexists
+with the `h2sa_reduced_x87` entry hooks, which translate these very
+functions):
+
+- the boom's cooldown timestamp is kept backdated past the window, so the
+  engine's own grow path raises the allowed length the first frame the way
+  is clear — the camera eases back out at its stock speed, immediately;
+- while a collision actually holds the camera below the player's wheel pick
+  (150 = in, 300 = out), the preferred distance is reset to the zoomed-out
+  preset: the wheel still works as a temporary override, but after an auto
+  zoom-in the camera opens fully at the first occasion instead of returning
+  to the closer pick.
+
+Zoom-in, the collision math, the easing speed and the [20,300] operating
+bounds are untouched. The camera object (one per scene) is caught the
+instant the engine activates it, by repointing the activation slot of its
+class vtable at a wrapper — a data patch, so it cannot collide with the
+x87 entry hooks and affects no other camera class; a low-priority
+background heap scan (by vtable pointer) doubles as a fallback, and the
+per-frame writes only touch a candidate that re-validates in place.
+Everything is gated on the retail `hitman2.exe` (PE timestamp + a byte
+signature checked after the packed exe unpacks itself); an unknown build
+logs a line and the feature turns itself off.
+
+Config: `scripts/h2sa_core.ini`, `[Camera]` section
+
+```ini
+[Camera]
+AutoZoomOut=1     ; zoom back out the moment the obstruction clears (and
+                  ; past the wheel pick after an auto zoom-in); 0 = stock
+                  ; behaviour (camera stays zoomed ~5s after clearing)
+```
+
+Expected log lines (`scripts/h2sa_core.log`): `camera: retail exe unpacked,
+AutoZoomOut armed` and `camera: activation hook installed` at startup,
+`camera: HM2StickCam at ... — adopted on activation` the moment each
+mission's camera goes live, and `camera: auto zoom-in at ... — preferred
+reset to 300` when a collision forces the camera below the wheel pick. The
+first few zoom-in episodes also log `camera: reopened to 300 in N ms after
+clearing` — with the feature working, N is the easing time (~10–150 ms),
+not the stock ~5000.
+
 ### Frame-rate cap
 
 Hitman 2's engine advances its simulation from the measured frame time, so on
@@ -337,7 +392,8 @@ Install output:
 
 - Loader: `d3d8.dll` (game root)
 - ASI: `scripts/h2sa_core.asi`
-- Config: `scripts/h2sa_core.ini` (`[Widescreen]` + `[Profiler]` sections)
+- Config: `scripts/h2sa_core.ini` (`[Widescreen]` + `[Camera]` +
+  `[Profiler]` sections)
 - Logs: `scripts/h2sa_asi_loader.log`, `scripts/h2sa_core.log`
 
 ## Plugin: Reduced x87 (`h2sa_reduced_x87.asi`)

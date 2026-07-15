@@ -79,7 +79,7 @@ cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 # performance profiler overlay (top-right; [Profiler] section of the ini).
 cp "$HERE/dist/h2sa_core.asi" "$GAME/scripts/"
 if [ ! -f "$GAME/scripts/h2sa_core.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nPreserveAspect=1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nMouseClipFix=-1\nMouseMotionFix=-1\nUIScale=-1\n\n[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=1\nOffsetX=8\nOffsetY=8\n' \
+    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nPreserveAspect=1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nMouseClipFix=-1\nMouseMotionFix=-1\nUIScale=-1\n\n[Camera]\nAutoZoomOut=1\n\n[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=1\nOffsetX=8\nOffsetY=8\n' \
         > "$GAME/scripts/h2sa_core.ini"
 elif ! grep -q '^[[:space:]]*UIScale' "$GAME/scripts/h2sa_core.ini"; then
     # migrate an existing config: enable the UI scale feature (UIScale=-1
@@ -88,6 +88,11 @@ elif ! grep -q '^[[:space:]]*UIScale' "$GAME/scripts/h2sa_core.ini"; then
         "$GAME/scripts/h2sa_core.ini" > "$GAME/scripts/h2sa_core.ini.tmp" \
         && mv "$GAME/scripts/h2sa_core.ini.tmp" "$GAME/scripts/h2sa_core.ini"
     echo "h2sa_core.ini: added UIScale=-1 to [Widescreen]"
+fi
+# migrate an existing config: add the camera auto zoom-out section
+if ! grep -q '^\[Camera\]' "$GAME/scripts/h2sa_core.ini"; then
+    printf '\n[Camera]\nAutoZoomOut=1\n' >> "$GAME/scripts/h2sa_core.ini"
+    echo "h2sa_core.ini: added [Camera] AutoZoomOut=1"
 fi
 # drop the retired UISharpen key from earlier builds (harmless but stale)
 if grep -q '^[[:space:]]*UISharpen' "$GAME/scripts/h2sa_core.ini" 2>/dev/null; then

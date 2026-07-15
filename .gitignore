@@ -8,5 +8,10 @@ __pycache__/
 dist/
 tests/*.exe
 
+# Working dir for the dumped/unpacked hitman2.exe + analysis scratch (see
+# README: tools/undump.py writes staging/hitman2.exe) — game binary, never
+# committed
+staging/
+
 # Release artifact — uploaded to GitHub Releases, not tracked
 h2sa-asi-plugins.zip

@@ -1915,12 +1915,21 @@ static void frame_pace_pre(IDirect3DDevice8 *dev)
     wait_until(g_pace_next, g_pace_freq);
 }
 
+/* on_present: the frame limiter's calibration plus the camera auto
+ * zoom-out's per-frame data writes (camera.c) — both after Present, on the
+ * game's main thread. */
+static void on_present_hook(void)
+{
+    h2sa_camera_frame();
+    frame_limit();
+}
+
 static const H2SAD3D8Hooks g_hooks = {
     H2SA_D3D8_HOOKS_VERSION,
     fix_present,
     fix_projection,
     NULL,           /* on_device */
-    frame_limit,    /* on_present: calibration / HW bookkeeping */
+    on_present_hook, /* on_present: camera auto zoom-out + limiter */
     frame_pace_pre, /* on_frame: committed SW limiter waits before Present */
     h2sa_uiscale_fix_viewport,  /* believed-space viewports -> backbuffer */
 };
@@ -1994,6 +2003,10 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             logf_("d3d8.dll loader / H2SA_RegisterD3D8Hooks not found — "
                   "is the bundled d3d8.dll installed and overridden?");
         }
+
+        /* the camera half (camera.c) — shares this log and ini ([Camera]
+         * section); its per-frame work runs from on_present_hook above */
+        h2sa_camera_init();
 
         /* the profiler half of h2sa_core (profiler.c) — shares this log and
          * ini, registers its own on_frame hook with the loader */
