@@ -79,7 +79,7 @@ cp "$HERE/dist/d3d8.dll" "$GAME/d3d8.dll"
 # performance profiler overlay (top-right; [Profiler] section of the ini).
 cp "$HERE/dist/h2sa_core.asi" "$GAME/scripts/"
 if [ ! -f "$GAME/scripts/h2sa_core.ini" ]; then
-    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nPreserveAspect=1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nMouseClipFix=-1\nMouseMotionFix=-1\nUIScale=-1\n\n[Camera]\nAutoZoomOut=1\n\n[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=1\nOffsetX=8\nOffsetY=8\n' \
+    printf '[Widescreen]\nEnabled=1\nFullscreen=0\nBorderless=-1\nPreserveAspect=1\nFOVCorrect=1\nFOVFactor=1.0\nCursorFix=0\nFpsCap=60\nVSync=-1\nMouseClipFix=-1\nMouseMotionFix=-1\nUIScale=-1\n\n[Camera]\nAutoZoomOut=1\n\n[DeathScreen]\nEnabled=1\nBackCol=101010\nHidePlane=1\n\n[Profiler]\nEnabled=1\nScale=1.0\nShowCPU=1\nOffsetX=8\nOffsetY=8\n' \
         > "$GAME/scripts/h2sa_core.ini"
 elif ! grep -q '^[[:space:]]*UIScale' "$GAME/scripts/h2sa_core.ini"; then
     # migrate an existing config: enable the UI scale feature (UIScale=-1
@@ -93,6 +93,17 @@ fi
 if ! grep -q '^\[Camera\]' "$GAME/scripts/h2sa_core.ini"; then
     printf '\n[Camera]\nAutoZoomOut=1\n' >> "$GAME/scripts/h2sa_core.ini"
     echo "h2sa_core.ini: added [Camera] AutoZoomOut=1"
+fi
+# migrate an existing config: add the death-screen recolor section
+if ! grep -q '^\[DeathScreen\]' "$GAME/scripts/h2sa_core.ini"; then
+    printf '\n[DeathScreen]\nEnabled=1\nBackCol=101010\nHidePlane=1\n' \
+        >> "$GAME/scripts/h2sa_core.ini"
+    echo "h2sa_core.ini: added [DeathScreen] Enabled=1 BackCol=101010 HidePlane=1"
+elif ! grep -q '^[[:space:]]*HidePlane' "$GAME/scripts/h2sa_core.ini"; then
+    awk '{ print } /^\[DeathScreen\]/ { print "HidePlane=1" }' \
+        "$GAME/scripts/h2sa_core.ini" > "$GAME/scripts/h2sa_core.ini.tmp" \
+        && mv "$GAME/scripts/h2sa_core.ini.tmp" "$GAME/scripts/h2sa_core.ini"
+    echo "h2sa_core.ini: added HidePlane=1 to [DeathScreen]"
 fi
 # drop the retired UISharpen key from earlier builds (harmless but stale)
 if grep -q '^[[:space:]]*UISharpen' "$GAME/scripts/h2sa_core.ini" 2>/dev/null; then

@@ -24,6 +24,13 @@ void h2sa_profiler_detach(void);
 void h2sa_camera_init(void);
 void h2sa_camera_frame(void);
 
+/* deathcol.c — recolor the white death-screen background ([DeathScreen]
+ * section). init parses the ini and starts the gated scanner; frame does
+ * the validated data writes from widescreen.c's on_frame hook (the game's
+ * main thread). */
+void h2sa_deathcol_init(void);
+void h2sa_deathcol_frame(void);
+
 /* uiscale.c — believed-resolution UI scaling. widescreen.c forwards the
  * [Widescreen] UIScale config, decides the backbuffer size in fix_present
  * and calls setup/off; the fix_viewport hook goes into widescreen.c's v4

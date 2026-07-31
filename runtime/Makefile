@@ -20,12 +20,12 @@ all: ../dist/d3d8.dll ../dist/h2sa_core.asi \
 	      -Wl,--enable-stdcall-fixup -luser32 -lgdi32
 
 # core plugin: widescreen/startup/mouse fixes + UI scaling + camera auto
-# zoom-out + the profiler overlay
+# zoom-out + death-screen recolor + the profiler overlay
 ../dist/h2sa_core.asi: widescreen.c profiler.c uiscale.c camera.c \
-                       h2sa_d3d8.h h2sa_core.h
+                       deathcol.c h2sa_d3d8.h h2sa_core.h
 	@mkdir -p ../dist
 	$(CC) $(CFLAGS) -o $@ widescreen.c profiler.c uiscale.c camera.c \
-	      $(LDFLAGS) -luser32 -lgdi32 -lwinmm
+	      deathcol.c $(LDFLAGS) -luser32 -lgdi32 -lwinmm
 
 ../dist/h2sa_reduced_x87.asi: h2sax87.c helpers.S
 	@mkdir -p ../dist

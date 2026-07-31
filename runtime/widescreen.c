@@ -1921,6 +1921,7 @@ static void frame_pace_pre(IDirect3DDevice8 *dev)
 static void on_present_hook(void)
 {
     h2sa_camera_frame();
+    h2sa_deathcol_frame();
     frame_limit();
 }
 
@@ -2007,6 +2008,11 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         /* the camera half (camera.c) — shares this log and ini ([Camera]
          * section); its per-frame work runs from on_present_hook above */
         h2sa_camera_init();
+
+        /* the death-screen recolor (deathcol.c) — shares this log and ini
+         * ([DeathScreen] section); per-frame writes run from
+         * on_present_hook above */
+        h2sa_deathcol_init();
 
         /* the profiler half of h2sa_core (profiler.c) — shares this log and
          * ini, registers its own on_frame hook with the loader */

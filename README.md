@@ -378,6 +378,58 @@ first few zoom-in episodes also log `camera: reopened to 300 in N ms after
 clearing` — with the feature working, N is the easing time (~10–150 ms),
 not the stock ~5000.
 
+### Death-screen recolor (`[DeathScreen]` section)
+
+When 47 dies, the engine cuts to a scene camera named
+`Cam_Right_Arm_OverrideBackCol` (defined in every level's GMS data). Camera
+names ending in `_OverrideBackCol` are special-cased by the engine's
+MainCameraControl: the whole background — clear color and the full-screen
+fog that swallows the world — is replaced with **that camera's `BackCol`
+property**, which ships as pure white (`FFFFFF`): the blinding white void
+behind the dying animation.
+
+`Enabled=1` rewrites that one dword of **game data** with a configurable
+dark color as soon as each scene loads — no code is patched and no D3D call
+is intercepted, so the engine performs the exact same death fade, just into
+a dark background instead of white. Only cameras whose name ends in
+`_OverrideBackCol` *and* whose `BackCol` is near-white are touched: scene
+moods and the black loading-fade camera (`BlackScreenCamera_...`) stay
+stock.
+
+The dying animation also plays out on **white quads** (the die-sequence
+template each level embeds: ZSTDOBJs `Plane_Lower` and `White_BloodCover`
+inside the off-world `Bounding_Room` — authored white to blend with the
+stock white background, so they read as a floating white square once the
+background is dark). Flag bits in their placed-instance records are NOT
+re-checked by the renderer once the death cut sequence has activated them
+(verified with live pokes on a paused death screen), but the record's 3x3
+matrix IS consumed every frame — so `HidePlane=1` keeps both quads'
+matrices zeroed (scale 0, nothing rasterized) and the body lies directly
+on the dark background. Set `HidePlane=0` if you prefer the quads (e.g.
+if you miss the blood pool and would rather keep the square).
+
+Objects are found by the same gated background scan as the camera feature
+(vtable-pointer / name sweep, retail-exe signature gate, RPM-only reads),
+and all writes run on the game's main thread after re-validating each
+object in place (proxy vtable/classinfo, instance back-pointer, flag
+magic 0x09/0x0B).
+
+Config: `scripts/h2sa_core.ini`, `[DeathScreen]` section
+
+```ini
+[DeathScreen]
+Enabled=1         ; 0 = stock blinding-white death background
+BackCol=101010    ; RRGGBB hex the white is replaced with (near black)
+HidePlane=1       ; collapse the white die-sequence quads (Plane_Lower,
+                  ; White_BloodCover); 0 = keep them
+```
+
+Expected log lines (`scripts/h2sa_core.log`): `deathscreen: retail exe
+unpacked, armed` at startup, `deathscreen: "Cam_Right_Arm_OverrideBackCol"
+at ... BackCol ffffff -> 101010` and `deathscreen: collapsed
+"Plane_Lower" ...` / `... collapsed "White_BloodCover" ...` once per
+scene load.
+
 ### Frame-rate cap
 
 Hitman 2's engine advances its simulation from the measured frame time, so on
@@ -393,7 +445,7 @@ Install output:
 - Loader: `d3d8.dll` (game root)
 - ASI: `scripts/h2sa_core.asi`
 - Config: `scripts/h2sa_core.ini` (`[Widescreen]` + `[Camera]` +
-  `[Profiler]` sections)
+  `[DeathScreen]` + `[Profiler]` sections)
 - Logs: `scripts/h2sa_asi_loader.log`, `scripts/h2sa_core.log`
 
 ## Plugin: Reduced x87 (`h2sa_reduced_x87.asi`)
