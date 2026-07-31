@@ -2018,6 +2018,83 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
          * ini, registers its own on_frame hook with the loader */
         h2sa_profiler_init((HMODULE)inst);
     } else if (reason == DLL_PROCESS_DETACH) {
+        /* Release any live cursor clip on the way out. wineserver keeps
+         * the clip rectangle per winstation (bottle-wide), NOT per
+         * process — if the game exits while camera-look has the cursor
+         * clipped, the stale rect keeps confining the host cursor in
+         * whatever wine window is focused next (observed: trapped in the
+         * Steam window after quitting the game). Real Windows releases
+         * the clip at process exit on its own, so this is a no-op there.
+         * Called directly (not via g_real_clipcursor) so it works even if
+         * the IAT hook never landed. */
+        ClipCursor(NULL);
+        logf_("detach: cursor clip released");
+        /* That released wineserver's clip — but winemac CACHES "clipping
+         * on" per process and re-applies it on every activation, so if
+         * Steam's driver picked the clip up (the exit race: Steam takes
+         * foreground the moment the game window dies, BEFORE this detach
+         * runs; or an alt-tab during play), the cursor stays trapped in
+         * the Steam window until Steam is restarted. wine only delivers
+         * clip updates to the FOREGROUND process's driver, so the reset
+         * must happen while Steam is foreground: wait here (game window
+         * is already gone, focus is moving to Steam) until a window of
+         * another wine process is foreground, then deliver one
+         * ClipCursor(rect)->ClipCursor(NULL) cycle to it. Verified live:
+         * this exact cycle frees an already-trapped cursor. If no foreign
+         * window shows up within ~2 s (user is in a native mac app), the
+         * NULL above already guarantees no stale cache can form later. */
+        {
+            DWORD self = GetCurrentProcessId();
+            int delivered = 0;
+            /* don't wait for macOS to drift focus over — hand the wine
+             * foreground to another process's window (Steam) ourselves;
+             * the dying foreground owner is allowed to give it away */
+            {
+                HWND w = GetTopWindow(NULL);
+                while (w) {
+                    DWORD wpid = 0;
+                    char wcls[64] = "";
+                    GetWindowThreadProcessId(w, &wpid);
+                    GetClassNameA(w, wcls, sizeof(wcls));
+                    if (IsWindowVisible(w) && wpid && wpid != self &&
+                        strcmp(wcls, "#32769") != 0) {
+                        SetForegroundWindow(w);
+                        logf_("detach: handed foreground to pid %lu (%s)",
+                              (unsigned long)wpid, wcls);
+                        break;
+                    }
+                    w = GetWindow(w, GW_HWNDNEXT);
+                }
+            }
+            for (int i = 0; i < 30 && !delivered; i++) {
+                HWND fg = GetForegroundWindow();
+                DWORD pid = 0;
+                char cls[64] = "";
+                if (fg) {
+                    GetWindowThreadProcessId(fg, &pid);
+                    GetClassNameA(fg, cls, sizeof(cls));
+                }
+                if (fg && pid && pid != self &&
+                    strcmp(cls, "#32769") != 0) {  /* not the wine desktop */
+                    POINT p;
+                    RECT r;
+                    if (!GetCursorPos(&p)) { p.x = 400; p.y = 300; }
+                    r.left = p.x - 200; r.top = p.y - 150;
+                    r.right = p.x + 200; r.bottom = p.y + 150;
+                    ClipCursor(&r);
+                    Sleep(250);
+                    ClipCursor(NULL);
+                    logf_("detach: unclip cycle delivered to foreground "
+                          "pid %lu (%s)", (unsigned long)pid, cls);
+                    delivered = 1;
+                }
+                if (!delivered)
+                    Sleep(100);
+            }
+            if (!delivered)
+                logf_("detach: no foreign foreground window within 3 s — "
+                      "server clip cleared only");
+        }
         restore_ini_resolution();
         h2sa_profiler_detach();
     }

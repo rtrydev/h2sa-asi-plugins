@@ -235,6 +235,18 @@ byte-offsets. (H2's `p5dll.dll` HID import drives the exotic **P5 data glove**,
 not the mouse — a red herring.) Set either to `0` to disable (both are off by
 default on real Windows, which needs neither).
 
+**Exit unclip.** winemac caches "cursor clipping on" per process and re-applies
+it on every activation, and wine only delivers clip changes to the foreground
+process — so quitting the game while a cursor clip was live used to leave the
+host cursor trapped in the Steam window until Steam was restarted (wineserver
+itself showed no clip; the stale state was Steam's winemac cache). On teardown
+the plugin now releases the clip, hands the wine foreground to the next wine
+window (Steam), and delivers one `ClipCursor(rect)` → `ClipCursor(NULL)` cycle
+to it, which makes Steam's driver drop the cached clip. Log lines:
+`detach: cursor clip released`, `detach: handed foreground to pid ...`,
+`detach: unclip cycle delivered to foreground pid ...`. (No-op on real
+Windows, which auto-releases clips at process exit.)
+
 ### UI scaling (`UIScale`)
 
 At a modern resolution the HUD and menus are tiny: the engine lays its whole
