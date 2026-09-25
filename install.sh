@@ -1,15 +1,70 @@
 #!/bin/bash
 # Install (or uninstall with -u) the H2SA plugins into the game.
-# Works on mac (CrossOver bottle) and on Windows under Git Bash / MSYS2.
+# Works on mac (CrossOver bottle), Linux (Steam Proton prefix) and on Windows
+# under Git Bash / MSYS2.
 set -e
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
         DEFAULT_GAME="/c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin";;
+    Linux)
+        DEFAULT_GAME="$HOME/.local/share/Steam/steamapps/common/Hitman 2 Silent Assassin";;
     *)
         DEFAULT_GAME="$HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin";;
 esac
 GAME="${H2SA_GAME_DIR:-$DEFAULT_GAME}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# KDE Plasma (X11): a KWin window rule that blocks compositing while the game
+# window is open. KWin composites even a fullscreen Wine window, and on this
+# stack (NVIDIA, 240Hz) that turns an even 60fps into visible judder; with
+# compositing blocked the game flips straight to the display. KWin resumes
+# compositing when the window closes. Matched on Steam's per-app window class.
+KWIN_RULE=h2sa-hitman2-block-compositing
+kwin_reconfigure() {
+    for q in qdbus6 qdbus; do
+        command -v "$q" >/dev/null 2>&1 &&
+            "$q" org.kde.KWin /KWin reconfigure >/dev/null 2>&1 && return
+    done
+}
+kwin_rule_install() {
+    command -v kwriteconfig6 >/dev/null 2>&1 || return 0
+    local rules
+    rules="$(kreadconfig6 --file kwinrulesrc --group General --key rules)"
+    case ",$rules," in
+        *",$KWIN_RULE,"*) ;;
+        *) rules="${rules:+$rules,}$KWIN_RULE" ;;
+    esac
+    local w="kwriteconfig6 --file kwinrulesrc --group $KWIN_RULE"
+    $w --key Description "Hitman 2 (h2sa): block compositing"
+    $w --key wmclass steam_app_6850
+    $w --key wmclassmatch 1
+    $w --key wmclasscomplete false
+    $w --key blockcompositing true
+    $w --key blockcompositingrule 2
+    kwriteconfig6 --file kwinrulesrc --group General --key rules "$rules"
+    kwriteconfig6 --file kwinrulesrc --group General --key count \
+        "$(printf '%s' "$rules" | tr ',' '\n' | grep -c .)"
+    kwin_reconfigure
+    echo "KWin: window rule '$KWIN_RULE' blocks compositing while the game runs"
+}
+kwin_rule_remove() {
+    command -v kwriteconfig6 >/dev/null 2>&1 || return 0
+    local rules
+    rules="$(kreadconfig6 --file kwinrulesrc --group General --key rules)"
+    case ",$rules," in *",$KWIN_RULE,"*) ;; *) return 0 ;; esac
+    rules="$(printf '%s' "$rules" | tr ',' '\n' | grep -vx "$KWIN_RULE" |
+             paste -sd, -)"
+    local k
+    for k in Description wmclass wmclassmatch wmclasscomplete \
+             blockcompositing blockcompositingrule; do
+        kwriteconfig6 --file kwinrulesrc --group "$KWIN_RULE" --key "$k" --delete
+    done
+    kwriteconfig6 --file kwinrulesrc --group General --key rules "$rules"
+    kwriteconfig6 --file kwinrulesrc --group General --key count \
+        "$(printf '%s' "$rules" | tr ',' '\n' | grep -c .)"
+    kwin_reconfigure
+    echo "KWin: removed window rule '$KWIN_RULE'"
+}
 
 # Files from before the snake_case rename / core merge (widescreen + profiler
 # are now one h2sa_core.asi). Removed on install and uninstall; the old inis
@@ -45,6 +100,7 @@ if [ "$1" = "-u" ]; then
     rm -f "$GAME/scripts/h2sa_dump.asi"
     rm -f "$GAME/scripts/h2sa_dump.log"
     remove_legacy
+    [ "$(uname -s)" = "Linux" ] && kwin_rule_remove
     # the plugin .ini is user config; left in place on purpose.
     # Hitman2.ini is not touched on uninstall; restore Hitman2.ini.bak by hand
     # if you want the original resolution back.
@@ -155,7 +211,39 @@ fi
 
 # Wine/CrossOver: the game-directory d3d8.dll only loads with the DLL
 # override d3d8=native,builtin. Add it to the bottle if we can find CrossOver.
-if [ "$(uname -s)" != "Darwin" ]; then
+if [ "$(uname -s)" = "Linux" ]; then
+    # Steam Proton: the override goes into the game's own prefix, which lives
+    # in the same Steam library as the game (steamapps/compatdata/6850). It is
+    # set per-app (AppDefaults\hitman2.exe) with the prefix's own Proton wine;
+    # config_info records which Proton build that is (its fonts dir, line 2).
+    COMPAT="$(cd "$GAME/../.." && pwd)/compatdata/6850"
+    PFX="$COMPAT/pfx"
+    PROTON_FILES="$(sed -n '2s#/share/fonts/*$##p' "$COMPAT/config_info" 2>/dev/null)"
+    KEY='HKCU\Software\Wine\AppDefaults\hitman2.exe\DllOverrides'
+    if grep -q '^\[Software\\\\Wine\\\\AppDefaults\\\\hitman2.exe\\\\DllOverrides\]' "$PFX/user.reg" 2>/dev/null &&
+       grep -A3 '^\[Software\\\\Wine\\\\AppDefaults\\\\hitman2.exe\\\\DllOverrides\]' "$PFX/user.reg" |
+       grep -q '^"d3d8"="native,builtin"'; then
+        echo "Proton prefix: d3d8=native,builtin already set for hitman2.exe"
+    elif pgrep -x hitman2.exe >/dev/null 2>&1; then
+        echo "WARNING: the game is running; quit it and re-run ./install.sh to"
+        echo "  set the d3d8=native,builtin DLL override in its Proton prefix."
+    elif [ -d "$PFX" ] && [ -x "$PROTON_FILES/bin/wine" ] &&
+         WINEPREFIX="$PFX" WINEDEBUG=-all "$PROTON_FILES/bin/wine" reg add \
+             "$KEY" /v d3d8 /d native,builtin /f >/dev/null 2>&1 &&
+         WINEPREFIX="$PFX" "$PROTON_FILES/bin/wineserver" -w; then
+        echo "Proton prefix: set DLL override d3d8=native,builtin for hitman2.exe"
+    else
+        echo "WARNING: could not set the d3d8 DLL override in the Proton prefix"
+        echo "  ($PFX — launch the game once through Steam to create it, then"
+        echo "  re-run ./install.sh). Or set the game's Steam launch options to:"
+        echo "    WINEDLLOVERRIDES=\"d3d8=n,b\" %command%"
+    fi
+    # Proton runs d3d8 on wined3d (GL) by default; DXVK's d3d8 (Vulkan) is
+    # opt-in per game, so it has to be a launch option.
+    echo "Recommended Steam launch options (Properties > General):"
+    echo "    PROTON_DXVK_D3D8=1 %command%"
+    kwin_rule_install
+elif [ "$(uname -s)" != "Darwin" ]; then
     :  # real Windows: app-dir DLLs win automatically, no override needed
 elif [ -n "$WINE" ] || [ -x "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine" ]; then
     CXWINE="${WINE:-/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine}"

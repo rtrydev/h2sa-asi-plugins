@@ -53,14 +53,14 @@
  *   FOVCorrect=1    ; Hor+ projection correction on/off
  *   FOVFactor=1.0   ; extra horizontal FOV multiplier (>1 = wider)
  *   CursorFix=0     ; hide the host (Mac) cursor over the game: 0 off
- *                   ; (default — see note), 1 on, -1 auto (on under Wine)
+ *                   ; (default — see note), 1 on, -1 auto (Wine on macOS)
  *   MouseClipFix=-1 ; fix the mouse-look "edge wall" under winemac by insetting
  *                   ; the renderer's full-window cursor clip so winemac switches
- *                   ; to relative mouse motion: -1 auto (Wine), 0 off, 1 on
+ *                   ; to relative mouse motion: -1 auto (Wine on macOS), 0 off, 1 on
  *   MouseMotionFix=-1 ; fix the slow-move camera stall by feeding the camera's
  *                   ; DirectInput mouse motion from the absolute OS cursor
  *                   ; (GetCursorPos) instead of winemac's lossy relative axis:
- *                   ; -1 auto (Wine), 0 off, 1 on
+ *                   ; -1 auto (Wine on macOS), 0 off, 1 on
  *   FpsCap=60       ; frame-rate cap (the engine is frame-time bound and
  *                   ; misbehaves uncapped); 0 = uncapped
  *   VSync=-1        ; -1 auto: in exclusive fullscreen, let the display pace
@@ -295,6 +295,32 @@ static int is_wine(void)
                           "wine_get_version") != NULL;
 }
 
+/* Wine on a macOS host (CrossOver / winemac) as opposed to Linux (Proton /
+ * winex11). The app-activation workarounds below exist only because a
+ * Steam-launched winemac process never gets Cocoa activation; on Linux the
+ * window manager focuses the game normally, and forcing foreground back
+ * there would just fight the user's alt-tab. */
+static const char *wine_host(void)   /* uname sysname, NULL off Wine */
+{
+    static const char *sys;
+    static int done;
+    if (!done) {
+        typedef void (CDECL *host_ver_t)(const char **, const char **);
+        host_ver_t f = (host_ver_t)(uintptr_t)GetProcAddress(
+            GetModuleHandleA("ntdll.dll"), "wine_get_host_version");
+        const char *rel = NULL;
+        if (f) f(&sys, &rel);
+        done = 1;
+    }
+    return sys;
+}
+
+static int is_wine_mac(void)
+{
+    const char *sys = wine_host();
+    return sys && !strcmp(sys, "Darwin");
+}
+
 /* The renderer's mode-set path snaps the requested resolution to a fixed 4:3
  * ladder (512x384 .. 1600x1200). For a width past the top of the ladder
  * (e.g. 1920) it falls through and loads the HEIGHT from an uninitialised
@@ -367,17 +393,17 @@ static DWORD WINAPI snap_watch(LPVOID arg)
 
 static int cursorfix_wanted(void)
 {
-    return g_cursorfix == 1 || (g_cursorfix == -1 && is_wine());
+    return g_cursorfix == 1 || (g_cursorfix == -1 && is_wine_mac());
 }
 
 static int mouseclipfix_wanted(void)
 {
-    return g_mouseclipfix == 1 || (g_mouseclipfix == -1 && is_wine());
+    return g_mouseclipfix == 1 || (g_mouseclipfix == -1 && is_wine_mac());
 }
 
 static int mousemotionfix_wanted(void)
 {
-    return g_mousemotionfix == 1 || (g_mousemotionfix == -1 && is_wine());
+    return g_mousemotionfix == 1 || (g_mousemotionfix == -1 && is_wine_mac());
 }
 
 /* Redirect one IAT entry (module imports dll!fn) to hook; saves the original
@@ -1106,7 +1132,7 @@ static DWORD WINAPI cursor_watch(LPVOID arg)
          * game with two kicks sent and the watcher stuck. A presenting game
          * is a pumping game, so this gate makes the kick safe; a deferred
          * kick simply fires on a later tick within the deadline. */
-        if (is_wine() && g_fg_deadline) {
+        if (is_wine_mac() && g_fg_deadline) {
             HWND w = g_game_hwnd;
             DWORD now = GetTickCount();
             DWORD lp = g_last_present;
@@ -1126,7 +1152,7 @@ static DWORD WINAPI cursor_watch(LPVOID arg)
          * it back. Only non-blocking calls — PostMessage + a wineserver-
          * side foreground change; no window creation, no focus bounce —
          * so it is safe even against a non-pumping game thread. */
-        if (is_wine() && g_borderless_active && (tick % 150) == 0) {
+        if (is_wine_mac() && g_borderless_active && (tick % 150) == 0) {
             HWND w = g_game_hwnd;
             if (w && IsWindow(w) && GetForegroundWindow() != w) {
                 PostMessageA(w, WM_MACDRV_ACTIVATE_ON_FOLLOWING_FOCUS, 0, 0);
@@ -1983,6 +2009,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             g_snap_done = 1;
         if (g_enabled)
             CreateThread(NULL, 0, cursor_watch, NULL, 0, NULL);
+        logf_("host: %s%s", is_wine() ? "Wine on " : "Windows",
+              is_wine() ? (wine_host() ? wine_host() : "?") : "");
         logf_("h2sa_core widescreen loaded%s, Fullscreen=%d Borderless=%d "
               "PreserveAspect=%d FOVCorrect=%d FOVFactor=%.2f FpsCap=%d "
               "VSync=%d MouseClipFix=%d MouseMotionFix=%d UIScale=%.2f, "

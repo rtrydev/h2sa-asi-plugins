@@ -58,6 +58,7 @@ By default `install.sh` targets:
 
 ```text
 mac:     $HOME/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Hitman 2 Silent Assassin
+Linux:   $HOME/.local/share/Steam/steamapps/common/Hitman 2 Silent Assassin
 Windows: C:\Program Files (x86)\Steam\steamapps\common\Hitman 2 Silent Assassin
 ```
 
@@ -74,6 +75,53 @@ On mac the installer also configures the bottle:
 - if `Hitman2.ini` still has the placeholder `Resolution 800x600`, bumps it
   to `1920x1080` (backup: `Hitman2.ini.bak`; override with
   `H2SA_RESOLUTION=WxH`).
+
+### Linux (Steam + Proton)
+
+```sh
+sudo apt install gcc-mingw-w64-i686              # Debian/Ubuntu
+sudo apt install python3-capstone python3-pefile # only for the x87 blob
+python3 tools/translate.py
+(cd runtime && make)
+./install.sh
+```
+
+Launch the game once through Steam before installing, so Proton creates the
+game's prefix (`steamapps/compatdata/6850/pfx`). The installer then sets the
+`d3d8=native,builtin` DLL override for `hitman2.exe` in that prefix with the
+prefix's own Proton `wine`. Without it, Wine uses its builtin d3d8 even
+though the proxy sits in the game directory. The plugins never load, and the
+stock exclusive-fullscreen device fails. An override set with plain
+`winecfg` lands in `~/.wine`, not in the Proton prefix, so it has no effect.
+If the installer cannot set the override (the game is running, or the prefix
+does not exist yet), set the game's Steam launch options to
+`WINEDLLOVERRIDES="d3d8=n,b" %command%` instead.
+
+Also set the game's Steam launch options to:
+
+```text
+PROTON_DXVK_D3D8=1 %command%
+```
+
+By default Proton runs Direct3D 8 on wined3d (OpenGL). This option switches
+it to DXVK's d3d8 (Vulkan), the usual choice for D3D8 games on Linux.
+The proxy forwards to whichever `d3d8.dll` Proton puts in the prefix, so both
+work with the plugins.
+
+On KDE Plasma (X11) the installer also adds a KWin window rule,
+*Hitman 2 (h2sa): block compositing*, matched on the game's window class
+`steam_app_6850`. KWin composites even a fullscreen Wine window, and on an
+NVIDIA card with a high-refresh (240 Hz) display that makes a perfectly even
+60 FPS judder. While the game window is open the rule suspends compositing,
+so frames go straight to the display. Compositing resumes when the game
+closes. `./install.sh -u` removes the rule, and you can also edit it in
+System Settings > Window Management > Window Rules.
+
+On Linux the macOS-only workarounds are off in their `-1` auto setting:
+startup focus kicks, periodic foreground reclaim, and the winemac mouse fixes
+(`MouseClipFix`, `MouseMotionFix`, `CursorFix`). Alt-tab behaves normally, and
+the camera reads Wine's raw DirectInput motion directly instead of the X11
+cursor, which `MouseMotionFix` would warp back to the centre every frame.
 
 ### Windows
 
